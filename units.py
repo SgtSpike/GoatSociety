@@ -227,7 +227,9 @@ class Unit(Entity):
     def _idle_ai(self, game):
         if self.utype != 'worker':
             en = self._nearest_enemy(game)
-            if en and self.distance_to(en) <= self.attack_range + TILE_SIZE * 0.5:
+            # _nearest_enemy already filters to sight range; if any enemy is visible,
+            # switch to attacking — _update_attack will chase if not yet in range.
+            if en:
                 self.atk_target = en
                 self.state = State.ATTACKING
 

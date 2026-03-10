@@ -65,6 +65,7 @@ class Game:
 
         self._pending_attack_move = False
         self.selected_resource = None   # ResourceNode clicked for inspection
+        self._active_cmd_team = None    # team context for message tagging
 
         # ↑ ↑ ↓ ↓ ← → ← → — you know what to do
         self._konami_buf  = []
@@ -177,9 +178,8 @@ class Game:
         # Win/lose check
         self._check_game_over()
 
-        # Message timers
-        self._messages = [(t, msg) for (t, msg) in self._messages if t > 0]
-        self._messages = [(t - dt, msg) for (t, msg) in self._messages]
+        # Message timers (stored as (duration, text, team) — team=None shows to all)
+        self._messages = [(t - dt, msg, tm) for (t, msg, tm) in self._messages if t > 0]
 
     # ================================================================= INPUT
     def handle_event(self, event, ui):
@@ -751,10 +751,14 @@ class Game:
 
     # ================================================================= MESSAGES
     def _add_message(self, text, duration=3.0):
-        self._messages.append((duration, text))
+        # Tag each message with the active command team so players only see
+        # messages triggered by their own actions. None = show to all players.
+        team = self._active_cmd_team if self._active_cmd_team is not None else self._my_team
+        self._messages.append((duration, text, team))
 
     def get_messages(self):
-        return [(t, msg) for (t, msg) in self._messages if t > 0]
+        return [(t, msg) for (t, msg, tm) in self._messages
+                if t > 0 and (tm is None or tm == self._my_team)]
 
     # ================================================================= NETWORK: SERIALISE
     def serialize_state(self) -> dict:
@@ -824,16 +828,24 @@ class Game:
                 'techs':     list(player.techs),
             })
 
+        projectiles_data = [
+            {'x': round(p.x, 1), 'y': round(p.y, 1),
+             'tx': round(p.target.x, 1) if p.target else round(p.x + 1, 1),
+             'ty': round(p.target.y, 1) if p.target else round(p.y, 1)}
+            for p in self.projectiles if p.alive
+        ]
+
         return {
-            't':          'state',
-            'units':      units_data,
-            'buildings':  buildings_data,
-            'resources':  resources_data,
-            'players':    players_data,
-            'game_over':  self.game_over,
-            'player_won': self.player_won,
-            'messages':   list(self._messages),
-            'time':       round(self.time_elapsed, 2),
+            't':           'state',
+            'units':       units_data,
+            'buildings':   buildings_data,
+            'resources':   resources_data,
+            'players':     players_data,
+            'projectiles': projectiles_data,
+            'game_over':   self.game_over,
+            'player_won':  self.player_won,
+            'messages':    list(self._messages),
+            'time':        round(self.time_elapsed, 2),
         }
 
     # ================================================================= NETWORK: APPLY STATE (CLIENT)
@@ -963,6 +975,16 @@ class Game:
             if e.alive and e.id in valid_ids
         ]
 
+        # --- Projectiles (lightweight render-only objects) ---
+        from types import SimpleNamespace
+        self.projectiles = [
+            SimpleNamespace(
+                x=pd['x'], y=pd['y'], alive=True,
+                target=SimpleNamespace(x=pd['tx'], y=pd['ty'], alive=True)
+            )
+            for pd in state.get('projectiles', [])
+        ]
+
         # --- Update fog of war from our team's perspective ---
         my_player = self.players[self.net_my_team]
         self.game_map.update_visibility(my_player.units, my_player.buildings)
@@ -970,7 +992,13 @@ class Game:
         # --- Game state ---
         self.game_over    = state.get('game_over', False)
         self.player_won   = state.get('player_won', False)
-        self._messages    = state.get('messages', [])
+        # Only import messages that belong to this player's team (or global ones)
+        raw = state.get('messages', [])
+        self._messages = [
+            (t, msg, tm) for t, msg, tm in
+            (item if len(item) == 3 else (*item, None) for item in raw)
+            if tm is None or tm == self.net_my_team
+        ]
         self.time_elapsed = state.get('time', self.time_elapsed)
 
     # ================================================================= NETWORK: APPLY COMMAND (HOST)
@@ -986,6 +1014,11 @@ class Game:
 
         if player is None:
             return
+
+        # Tag any messages generated here with the client's team so they route
+        # back to the correct player and not to the host.
+        prev_cmd_team = self._active_cmd_team
+        self._active_cmd_team = team
 
         units = [u for u in player.units if u.id in unit_ids]
 
@@ -1067,3 +1100,5 @@ class Game:
                         for ftx, fty in b.tile_footprint():
                             self.game_map.gates.pop((ftx, fty), None)
                     b.alive = False
+
+        self._active_cmd_team = prev_cmd_team

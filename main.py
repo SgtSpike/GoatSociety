@@ -554,6 +554,10 @@ def main():
                 game.net_mode     = 'host'
                 game.net_my_team  = 0
                 game._net_session = session
+                # Team 1 is human-controlled — cancel the AI's auto-assigned gather
+                from constants import AI_TEAM
+                for u in game.players[AI_TEAM].units:
+                    u.stop()
                 run_game_loop(screen, game_surf, clock, game, assets,
                               session=session, is_host=True)
             session.close()

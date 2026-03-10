@@ -122,7 +122,7 @@ class UI:
     def _draw_top_bar(self, screen, game):
         pygame.draw.rect(screen, (22, 22, 30), (0, 0, SCREEN_W, TOP_BAR_H))
         pygame.draw.line(screen, PANEL_BORD, (0, TOP_BAR_H - 1), (SCREEN_W, TOP_BAR_H - 1), 1)
-        p = game.players[0]
+        p = game.players[game._my_team]
 
         items = [
             (f"Wood: {p.wood}", (180, 140, 80)),
@@ -142,10 +142,12 @@ class UI:
         ts = self.font_lg.render(time_str, True, (180, 180, 190))
         screen.blit(ts, (SCREEN_W // 2 - ts.get_width() // 2, TOP_BAR_H // 2 - ts.get_height() // 2))
 
-        # Win/Lose overlay
-        if game.game_over:
-            msg = "VICTORY!" if game.player_won else "DEFEAT"
-            col = (80, 240, 80) if game.player_won else (240, 60, 60)
+        # Win/Lose overlay — only in singleplayer; multiplayer uses run_game_loop's overlay
+        # which correctly inverts the result for the client player.
+        if game.game_over and game.net_mode is None:
+            won = game.player_won
+            msg = "VICTORY!" if won else "DEFEAT"
+            col = (80, 240, 80) if won else (240, 60, 60)
             big = pygame.font.SysFont("Arial", 52, bold=True).render(msg, True, col)
             screen.blit(big, (SCREEN_W // 2 - big.get_width() // 2,
                                SCREEN_H // 2 - big.get_height() // 2))
