@@ -120,7 +120,7 @@ class Projectile:
         self.speed  = speed
         self.alive  = True
 
-    def update(self, dt):
+    def update(self, dt, game=None):
         if not self.target or not self.target.alive:
             self.alive = False
             return
@@ -128,8 +128,12 @@ class Projectile:
         dy = self.target.y - self.y
         dist = math.hypot(dx, dy)
         if dist < 6:
+            team_attacked = self.target.team
+            tx, ty = self.target.x, self.target.y
             self.target.take_damage(self.damage)
             self.alive = False
+            if game is not None:
+                game.add_attack_event(tx, ty, team_attacked)
         else:
             move = min(self.speed * dt, dist)
             self.x += dx / dist * move

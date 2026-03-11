@@ -178,6 +178,24 @@ class Assets:
                                  (bx, by), (int(bx + 12 * math.cos(a)), int(by + 12 * math.sin(a))), 2)
             pygame.draw.rect(s, tc, (3, ph // 3, pw - 6, 4))
 
+        elif btype == 'mine':
+            # Stone building with mine shaft entrance
+            pygame.draw.rect(s, (88, 84, 95), (3, ph // 3, pw - 6, ph - ph // 3 - 3))
+            pygame.draw.polygon(s, (65, 62, 72),
+                                [(0, ph // 3 + 2), (pw // 2, 4), (pw, ph // 3 + 2)])
+            # shaft entrance arch
+            ex, ey = pw // 2 - 8, ph // 2
+            pygame.draw.rect(s, (22, 18, 12), (ex, ey, 16, ph - ey - 2))
+            pygame.draw.ellipse(s, (22, 18, 12), (ex, ey - 8, 16, 16))
+            # timber supports
+            pygame.draw.line(s, (100, 65, 22), (ex, ey), (ex, ey + 14), 2)
+            pygame.draw.line(s, (100, 65, 22), (ex + 16, ey), (ex + 16, ey + 14), 2)
+            pygame.draw.line(s, (100, 65, 22), (ex, ey), (ex + 16, ey), 2)
+            # gold nugget glint
+            pygame.draw.ellipse(s, (220, 185, 30), (pw // 2 - 14, ph // 2 - 6, 6, 4))
+            pygame.draw.ellipse(s, (220, 185, 30), (pw // 2 - 5,  ph // 2 - 10, 5, 3))
+            pygame.draw.rect(s, tc, (3, ph // 3, pw - 6, 4))
+
         elif btype == 'barracks':
             pygame.draw.rect(s, (82, 82, 95), (2, ph // 3, pw - 4, ph - ph // 3 - 3))
             pygame.draw.polygon(s, (60, 60, 72),
@@ -225,9 +243,16 @@ class Assets:
             pygame.draw.polygon(s, tc, [(pw // 2, -12), (pw // 2 + 14, -6), (pw // 2, 0)])
 
         elif btype == 'wall':
+            # Horizontal wall (default)
             pygame.draw.rect(s, (105, 105, 115), (1, ph // 3, pw - 2, ph - ph // 3 - 1))
             pygame.draw.rect(s, (85, 85, 95), (0, ph // 3, pw, 4))
             pygame.draw.rect(s, tc, (1, ph // 3, pw - 2, 3))
+
+        elif btype == 'wall_v':
+            # Vertical wall variant
+            pygame.draw.rect(s, (105, 105, 115), (pw // 3, 1, pw - pw // 3 - 1, ph - 2))
+            pygame.draw.rect(s, (85, 85, 95), (pw // 3, 0, 4, ph))
+            pygame.draw.rect(s, tc, (pw // 3, 1, 3, ph - 2))
 
         elif btype == 'gate':
             # Stone pillars on each side
@@ -244,10 +269,12 @@ class Assets:
 
         return s
 
+    _BUILDING_SIZE_OVERRIDES = {'wall_v': (1, 1)}
+
     def _make_buildings(self):
-        btypes = list(BUILDING_SIZES.keys())
+        btypes = list(BUILDING_SIZES.keys()) + ['wall_v']
         for btype in btypes:
-            w, h = BUILDING_SIZES[btype]
+            w, h = self._BUILDING_SIZE_OVERRIDES.get(btype, BUILDING_SIZES.get(btype, (2, 2)))
             for team in [0, 1]:
                 self.buildings[f'{btype}_{team}'] = self._draw_building(btype, w, h, team)
 

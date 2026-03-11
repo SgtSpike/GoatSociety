@@ -22,6 +22,7 @@ class ResourceNode:
         if self.depleted and game_map is not None:
             game_map.set_passable(self.tx, self.ty, True)
             game_map.set_buildable(self.tx, self.ty, True)
+            game_map.tiles[self.tx][self.ty] = TILE_DIRT
         return taken
 
 

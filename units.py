@@ -5,8 +5,14 @@ import pygame
 from entities import Entity
 from commands import Cmd, CmdData
 from constants import (TILE_SIZE, UNIT_STATS, WOOD_PER_TRIP, GOLD_PER_TRIP,
-                       GATHER_TIME, MAP_W, MAP_H)
+                       GATHER_TIME, MAP_W, MAP_H, PLAYER_TEAM)
 import pathfinding as pf
+try:
+    import sounds
+except Exception:
+    class sounds:  # type: ignore
+        @staticmethod
+        def play(*a, **kw): pass
 
 
 class State:
@@ -318,8 +324,16 @@ class Unit(Entity):
         dmg = self.attack_dmg + self.dmg_bonus
         if self.utype == 'archer':
             game.spawn_projectile(self.x, self.y, target, dmg)
+            if self.team == PLAYER_TEAM:
+                sounds.play('arrow_fire')
         else:
+            was_alive = target.alive
             target.take_damage(dmg)
+            game.add_attack_event(target.x, target.y, target.team)
+            if self.team == PLAYER_TEAM:
+                sounds.play('attack_melee')
+            if was_alive and not target.alive:
+                sounds.play('unit_death')
 
     # --------------------------------------------------------------- gathering
     def _update_gather(self, dt, game):
@@ -345,7 +359,12 @@ class Unit(Entity):
         adj_cy = rty * TILE_SIZE + TILE_SIZE // 2
         dist = math.hypot(self.x - adj_cx, self.y - adj_cy)
 
-        if dist > TILE_SIZE * 1.6:
+        # "at goal" = worker arrived at the adjacent tile it was heading for
+        at_goal = (self._path_goal is not None and
+                   (self.tx, self.ty) == self._path_goal)
+        need_move = dist > TILE_SIZE * 1.6 and not at_goal
+
+        if need_move:
             if self._wait_t > 0:
                 self._wait_t -= dt
                 if self._wait_t <= 0:
@@ -374,12 +393,19 @@ class Unit(Entity):
                 taken = node.gather(amount, game.game_map)
                 if node.type == 'wood':
                     self.carry_wood += taken
+                    if self.team == PLAYER_TEAM:
+                        sounds.play('chop')
                 else:
                     self.carry_gold += taken
+                    if self.team == PLAYER_TEAM:
+                        sounds.play('clink')
+                if node.depleted:
+                    sounds.play('resource_depleted')
                 self.state = State.RETURNING
 
     def _update_return(self, dt, game):
-        storage = game.nearest_storage(self.tx, self.ty, self.team)
+        rtype = 'wood' if self.carry_wood else 'gold'
+        storage = game.nearest_storage(self.tx, self.ty, self.team, rtype=rtype)
         if storage is None:
             self.state = State.IDLE
             return

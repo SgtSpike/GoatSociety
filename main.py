@@ -456,6 +456,11 @@ def run_game_loop(screen, game_surf, clock, game, assets,
                 else:
                     game.handle_event(event, ui)
 
+            elif event.type == pygame.MOUSEWHEEL:
+                # Zoom in/out with scroll wheel
+                factor = 1.1 if event.y > 0 else (1 / 1.1)
+                game.zoom = max(0.4, min(3.0, game.zoom * factor))
+
             elif event.type in (pygame.MOUSEBUTTONDOWN, pygame.MOUSEBUTTONUP,
                                  pygame.MOUSEMOTION):
                 game.handle_event(_transform_mouse_event(event), ui)
@@ -522,6 +527,8 @@ def run_game_loop(screen, game_surf, clock, game, assets,
 
 def main():
     pygame.init()
+    import sounds as sounds_mod
+    sounds_mod.init()
     pygame.display.set_caption(TITLE)
     screen   = pygame.display.set_mode((SCREEN_W, SCREEN_H), pygame.RESIZABLE)
     game_surf= pygame.Surface((SCREEN_W, SCREEN_H))

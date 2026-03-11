@@ -5,7 +5,17 @@ from entities import Entity
 from commands import Cmd, CmdData
 from constants import (TILE_SIZE, BUILDING_SIZES, BUILDING_HP, BUILD_TIMES,
                        BUILDING_TRAINS, UNIT_COSTS, TRAIN_TIMES,
-                       TECH_COSTS, TECH_TIMES)
+                       TECH_COSTS, TECH_TIMES, PLAYER_TEAM)
+try:
+    import sounds
+except Exception:
+    class sounds:  # type: ignore
+        @staticmethod
+        def play(*a, **kw): pass
+
+TOWER_RANGE       = 7 * TILE_SIZE   # pixels
+TOWER_DAMAGE      = 20
+TOWER_ATTACK_SPD  = 0.8             # attacks per second
 
 
 class Building(Entity):
@@ -35,6 +45,7 @@ class Building(Entity):
         self.research_queue   = deque()
         self.research_progress= 0.0
         self.rally_point      = None   # (world_px_x, world_px_y)
+        self.atk_cd           = 0.0   # tower attack cooldown
 
     # --- Coordinate properties (override Entity's tx/ty/x/y) ---------------
     @property
@@ -72,6 +83,28 @@ class Building(Entity):
             return
         self._update_training(dt, game)
         self._update_research(dt, game)
+        if self.btype == 'tower':
+            self._update_tower(dt, game)
+
+    def _update_tower(self, dt, game):
+        if self.atk_cd > 0:
+            self.atk_cd -= dt
+            return
+        # Find nearest enemy unit or building within range
+        best, best_d = None, TOWER_RANGE
+        for team_id, player in game.players.items():
+            if team_id == self.team:
+                continue
+            for unit in player.units:
+                if unit.alive:
+                    d = math.hypot(unit.x - self.x, unit.y - self.y)
+                    if d < best_d:
+                        best_d, best = d, unit
+        if best:
+            game.spawn_projectile(self.x, self.y, best, TOWER_DAMAGE)
+            self.atk_cd = 1.0 / TOWER_ATTACK_SPD
+            if self.team == PLAYER_TEAM:
+                sounds.play('tower_fire')
 
     def _update_training(self, dt, game):
         if not self.train_queue:
@@ -105,6 +138,8 @@ class Building(Entity):
             self.research_queue.popleft()
             game.players[self.team].techs.add(tech)
             game.apply_tech(self.team, tech)
+            if self.team == PLAYER_TEAM:
+                sounds.play('research_complete')
 
     def _spawn_point(self, game):
         for r in range(1, 7):
@@ -121,7 +156,10 @@ class Building(Entity):
     def complete(self, game):
         self.is_constructed = True
         self.construction_progress = 1.0
-        for ftx, fty in self.tile_footprint():
+        if self.team == PLAYER_TEAM:
+            sounds.play('building_complete')
+        footprint = set(self.tile_footprint())
+        for ftx, fty in footprint:
             if self.btype == 'gate':
                 # Gate stays passable for the owning team; enemies are blocked by team-aware A*
                 game.game_map.gates[(ftx, fty)] = self.team
@@ -130,6 +168,19 @@ class Building(Entity):
             else:
                 game.game_map.set_passable(ftx, fty, False)
                 game.game_map.set_buildable(ftx, fty, False)
+
+        # Eject any units standing on the building's footprint
+        if self.btype != 'gate':
+            import pathfinding as pf
+            for player in game.players.values():
+                for unit in player.units:
+                    if (unit.tx, unit.ty) in footprint:
+                        escape = pf.adjacent_passable(game.game_map, unit.tx, unit.ty)
+                        if escape:
+                            unit.x = escape[0] * TILE_SIZE + TILE_SIZE // 2
+                            unit.y = escape[1] * TILE_SIZE + TILE_SIZE // 2
+                            unit._path = []
+                            unit._path_cd = 0.0
 
     # --------------------------------------------------------- training
     def trainable_units(self, player):
@@ -140,10 +191,20 @@ class Building(Entity):
             units.remove('knight')
         return units
 
+    def _worker_cost(self, player):
+        """Flexible worker cost: 25+25 if possible, else 50 of any single resource."""
+        if player.wood >= 25 and player.gold >= 25:
+            return {'wood': 25, 'gold': 25, 'food': 1}
+        if player.wood >= 50:
+            return {'wood': 50, 'gold': 0, 'food': 1}
+        if player.gold >= 50:
+            return {'wood': 0, 'gold': 50, 'food': 1}
+        return {'wood': 25, 'gold': 25, 'food': 1}  # will fail affordability check
+
     def can_train(self, utype, player):
         if len(self.train_queue) >= 5:
             return False, "Queue full"
-        cost = UNIT_COSTS.get(utype, {})
+        cost = self._worker_cost(player) if utype == 'worker' else UNIT_COSTS.get(utype, {})
         if player.food + cost.get('food', 0) > player.food_cap:
             return False, "Pop cap reached"
         if player.wood < cost.get('wood', 0):
@@ -156,8 +217,14 @@ class Building(Entity):
         ok, _ = self.can_train(utype, player)
         if not ok:
             return False
-        player.pay_unit(utype)
-        self.train_queue.append(utype)
+        if utype == 'worker':
+            cost = self._worker_cost(player)
+            player.wood -= cost['wood']
+            player.gold -= cost['gold']
+            self.train_queue.append(utype)
+        else:
+            player.pay_unit(utype)
+            self.train_queue.append(utype)
         return True
 
     def cancel_last_in_queue(self, player):
@@ -176,8 +243,6 @@ class Building(Entity):
             return False, "Already done"
         if tech in self.research_queue:
             return False, "Already queued"
-        if self.research_queue:
-            return False, "Research in progress"
         cost = TECH_COSTS.get(tech, {})
         if player.wood < cost.get('wood', 0):
             return False, "Need wood"

@@ -6,7 +6,7 @@ def heuristic(a, b):
     return max(abs(a[0] - b[0]), abs(a[1] - b[1]))   # Chebyshev
 
 
-def astar(game_map, start, goal, team=None, max_iter=3000):
+def astar(game_map, start, goal, team=None, max_iter=12000):
     """Return list of (tx,ty) tile steps from start to goal (excluding start).
     If team is given, enemy gates are treated as impassable.
     If goal is impassable, snaps to nearest passable neighbour first.

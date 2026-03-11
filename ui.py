@@ -5,7 +5,7 @@ button clicks.  Returns UIAction objects that game.py acts on.
 import pygame
 import display as display_mod
 from constants import (SCREEN_W, SCREEN_H, TOP_BAR_H, BOTTOM_PANEL_H,
-                       VIEWPORT_Y, VIEWPORT_H, MINIMAP_W, MINIMAP_H,
+                       VIEWPORT_Y, VIEWPORT_W, VIEWPORT_H, MINIMAP_W, MINIMAP_H,
                        TILE_SIZE, TEAM_COLORS, BUILDING_SIZES,
                        BUILDING_COSTS, UNIT_COSTS, UNIT_STATS,
                        TECH_COSTS, TECH_LABELS, TECH_TIMES, BUILD_TIMES,
@@ -18,7 +18,8 @@ from units import Unit
 BUILDING_DESCRIPTIONS = {
     'town_hall':     'Your base. Train workers and store resources.',
     'farm':          'Raises population cap by +10. Build more to support larger armies.',
-    'lumber_mill':   'Workers gather wood faster and carry more per trip.',
+    'lumber_mill':   'Workers can return wood here. Speeds up gathering nearby.',
+    'mine':          'Workers return gold here. Build near gold deposits to save travel time.',
     'barracks':      'Trains Soldiers — sturdy front-line melee fighters.',
     'archery_range': 'Trains Archers and, once researched, Knights.',
     'academy':       'Unlocks powerful upgrades for your entire army.',
@@ -81,6 +82,10 @@ class UI:
         # Button list populated each draw: [(rect, UIAction), ...]
         self._buttons   = []
 
+        # Idle worker cycling
+        self._idle_worker_idx = 0
+        self._idle_worker_btn = None   # rect, updated each draw
+
         # Panel rects (computed once)
         panel_y = VIEWPORT_Y + VIEWPORT_H
         self.panel_rect = pygame.Rect(0, panel_y, SCREEN_W, BOTTOM_PANEL_H)
@@ -123,7 +128,9 @@ class UI:
         pygame.draw.rect(screen, (22, 22, 30), (0, 0, SCREEN_W, TOP_BAR_H))
         pygame.draw.line(screen, PANEL_BORD, (0, TOP_BAR_H - 1), (SCREEN_W, TOP_BAR_H - 1), 1)
         p = game.players[game._my_team]
+        cy = TOP_BAR_H // 2
 
+        # Resources
         items = [
             (f"Wood: {p.wood}", (180, 140, 80)),
             (f"Gold: {p.gold}", (240, 200, 50)),
@@ -132,15 +139,36 @@ class UI:
         x = 16
         for text, col in items:
             surf = self.font_lg.render(text, True, col)
-            screen.blit(surf, (x, TOP_BAR_H // 2 - surf.get_height() // 2))
+            screen.blit(surf, (x, cy - surf.get_height() // 2))
             x += surf.get_width() + 40
 
-        # Game time
+        # Gatherer counts
+        wood_g, gold_g = game.gatherer_counts(game._my_team)
+        gc_text = f"  \u2663{wood_g}  \u25c6{gold_g}"
+        gc_surf = self.font_sm.render(gc_text, True, (160, 155, 130))
+        screen.blit(gc_surf, (x, cy - gc_surf.get_height() // 2))
+
+        # Game time (center)
         mins = int(game.time_elapsed) // 60
         secs = int(game.time_elapsed) % 60
         time_str = f"{mins:02d}:{secs:02d}"
         ts = self.font_lg.render(time_str, True, (180, 180, 190))
-        screen.blit(ts, (SCREEN_W // 2 - ts.get_width() // 2, TOP_BAR_H // 2 - ts.get_height() // 2))
+        screen.blit(ts, (SCREEN_W // 2 - ts.get_width() // 2, cy - ts.get_height() // 2))
+
+        # Idle worker button (right side of time, before minimap area)
+        idle_workers = game.idle_workers(game._my_team)
+        n_idle = len(idle_workers)
+        btn_text = f"Idle: {n_idle}"
+        btn_col = (200, 80, 60) if n_idle > 0 else (80, 90, 80)
+        btn_surf = self.font_md.render(btn_text, True, btn_col)
+        btn_x = SCREEN_W * 3 // 4
+        btn_rect = pygame.Rect(btn_x - 4, cy - btn_surf.get_height() // 2 - 2,
+                               btn_surf.get_width() + 8, btn_surf.get_height() + 4)
+        mx, my = display_mod.get_mouse_pos()
+        if btn_rect.collidepoint(mx, my):
+            pygame.draw.rect(screen, (50, 50, 62), btn_rect, border_radius=3)
+        screen.blit(btn_surf, (btn_x, cy - btn_surf.get_height() // 2))
+        self._idle_worker_btn = btn_rect
 
         # Win/Lose overlay — only in singleplayer; multiplayer uses run_game_loop's overlay
         # which correctly inverts the result for the client player.
@@ -251,6 +279,10 @@ class UI:
                         f"Research: {ent.research_queue[0]} {int(ent.research_progress*100)}%",
                         True, (200, 160, 240))
                     screen.blit(rs, (px, py)); py += 14
+                    if len(ent.research_queue) > 1:
+                        qs = self.font_sm.render(
+                            f"Queue: {list(ent.research_queue)[1:]}", True, GRAY)
+                        screen.blit(qs, (px, py)); py += 14
 
         else:
             # Multi-select summary
@@ -345,7 +377,10 @@ class UI:
             lines.append((
                 f'SPD:{stats.get("speed","?")}  RNG:{stats.get("range","?")} tiles',
                 C_STAT, False))
-            lines.append((f'Cost: {w} Wood   {g} Gold   {f} Food', C_COST, False))
+            if utype == 'worker':
+                lines.append(('Cost: 25 Wood + 25 Gold  (or 50 of either)', C_COST, False))
+            else:
+                lines.append((f'Cost: {w} Wood   {g} Gold   {f} Food', C_COST, False))
             return lines
 
         def _tech_tip(tech):
@@ -362,14 +397,16 @@ class UI:
 
         buttons = []
         player  = game.players[game._my_team]
+        has_units = any(isinstance(e, Unit) for e in sel)
 
-        # -- All selections: stop / hold
-        buttons.append(('cmd_stop',  UIAction(UIAction.STOP), [('Stop (S)', C_HEAD, True)]))
-        buttons.append(('cmd_hold',  UIAction(UIAction.HOLD), [('Hold Position (H)', C_HEAD, True)]))
-        if any(isinstance(e, Unit) and e.utype != 'worker' for e in sel):
-            buttons.append(('cmd_attack_move', UIAction(UIAction.ATTACK_MOVE),
-                            [('Attack Move (A)', C_HEAD, True),
-                             ('Move while auto-attacking enemies in range.', C_DESC, False)]))
+        # -- Unit selections: stop / hold / attack-move
+        if has_units:
+            buttons.append(('cmd_stop',  UIAction(UIAction.STOP), [('Stop (X)', C_HEAD, True)]))
+            buttons.append(('cmd_hold',  UIAction(UIAction.HOLD), [('Hold Position (H)', C_HEAD, True)]))
+            if any(isinstance(e, Unit) and e.utype != 'worker' for e in sel):
+                buttons.append(('cmd_attack_move', UIAction(UIAction.ATTACK_MOVE),
+                                [('Attack Move (A)', C_HEAD, True),
+                                 ('Move while auto-attacking enemies in range.', C_DESC, False)]))
 
         # -- Single building
         if len(sel) == 1 and isinstance(sel[0], Building):
@@ -394,7 +431,7 @@ class UI:
         # -- Workers: show build menu
         workers = [e for e in sel if isinstance(e, Unit) and e.utype == 'worker']
         if workers:
-            build_order = ['farm', 'lumber_mill', 'barracks',
+            build_order = ['farm', 'lumber_mill', 'mine', 'barracks',
                            'archery_range', 'academy', 'tower', 'wall', 'gate']
             for btype in build_order:
                 buttons.append((f'build_{btype}',
@@ -444,15 +481,31 @@ class UI:
     # ================================================================ EVENTS
     def handle_click(self, pos, game):
         """Process a left-click on the UI layer.  Returns UIAction or None."""
+        # Idle worker button: cycle through idle workers
+        if self._idle_worker_btn and self._idle_worker_btn.collidepoint(pos):
+            idle = game.idle_workers(game._my_team)
+            if idle:
+                self._idle_worker_idx = self._idle_worker_idx % len(idle)
+                worker = idle[self._idle_worker_idx]
+                self._idle_worker_idx = (self._idle_worker_idx + 1) % len(idle)
+                for e in game.selection:
+                    e.selected = False
+                game.selection = [worker]
+                worker.selected = True
+                game.cam_x = worker.x - VIEWPORT_W / 2
+                game.cam_y = worker.y - VIEWPORT_H / 2
+                game._clamp_camera()
+            return None
+
         for rect, action in self._buttons:
             if rect.collidepoint(pos):
                 return action
 
         # Minimap click → scroll camera
         if self.minimap_inner.collidepoint(pos):
+            from constants import MAP_W, MAP_H, TILE_SIZE
             rx = (pos[0] - self.minimap_inner.x) / self.minimap_inner.width
             ry = (pos[1] - self.minimap_inner.y) / self.minimap_inner.height
-            from constants import MAP_W, MAP_H, VIEWPORT_W, VIEWPORT_H, TILE_SIZE
             game.cam_x = rx * MAP_W * TILE_SIZE - VIEWPORT_W / 2
             game.cam_y = ry * MAP_H * TILE_SIZE - VIEWPORT_H / 2
             game._clamp_camera()

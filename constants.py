@@ -73,6 +73,7 @@ BUILDING_SIZES = {
     'town_hall':     (4, 3),
     'farm':          (3, 2),
     'lumber_mill':   (2, 2),
+    'mine':          (2, 2),
     'barracks':      (3, 2),
     'archery_range': (3, 2),
     'academy':       (3, 3),
@@ -85,6 +86,7 @@ BUILDING_SIZES = {
 BUILDING_COSTS = {
     'farm':          {'wood': 20,  'gold': 10},
     'lumber_mill':   {'wood': 80,  'gold': 30},
+    'mine':          {'wood': 60,  'gold': 0},
     'barracks':      {'wood': 120, 'gold': 60},
     'archery_range': {'wood': 120, 'gold': 80},
     'academy':       {'wood': 180, 'gold': 120},
@@ -98,6 +100,7 @@ BUILD_TIMES = {
     'town_hall':     0,   # pre-built at game start
     'farm':          18,
     'lumber_mill':   22,
+    'mine':          20,
     'barracks':      28,
     'archery_range': 32,
     'academy':       45,
@@ -111,6 +114,7 @@ BUILDING_HP = {
     'town_hall':     900,
     'farm':          200,
     'lumber_mill':   280,
+    'mine':          300,
     'barracks':      450,
     'archery_range': 380,
     'academy':       500,

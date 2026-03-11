@@ -20,6 +20,12 @@ from commands import Cmd, CmdData
 from ai import AIController
 from ui import UIAction
 import display as display_mod
+try:
+    import sounds
+except Exception:
+    class sounds:  # type: ignore
+        @staticmethod
+        def play(*a, **kw): pass
 
 
 class Game:
@@ -66,6 +72,12 @@ class Game:
         self._pending_attack_move = False
         self.selected_resource = None   # ResourceNode clicked for inspection
         self._active_cmd_team = None    # team context for message tagging
+
+        # Attack flash events: [(wx, wy, team_attacked, timer)]
+        self.attack_events = []
+
+        # Viewport zoom (1.0 = normal, >1 = zoom in, <1 = zoom out)
+        self.zoom = 1.0
 
         # ↑ ↑ ↓ ↓ ← → ← → — you know what to do
         self._konami_buf  = []
@@ -156,16 +168,21 @@ class Game:
             for bld in list(player.buildings):
                 if bld.alive:
                     bld.update(dt, self)
-            # Cleanup gate tiles for any gate that just died
+            # Restore passability for any building that just died
             for bld in player.buildings:
-                if not bld.alive and bld.btype == 'gate' and bld.is_constructed:
-                    for ftx, fty in bld.tile_footprint():
-                        self.game_map.gates.pop((ftx, fty), None)
+                if not bld.alive and bld.is_constructed:
+                    if bld.btype == 'gate':
+                        for ftx, fty in bld.tile_footprint():
+                            self.game_map.gates.pop((ftx, fty), None)
+                    else:
+                        for ftx, fty in bld.tile_footprint():
+                            self.game_map.set_passable(ftx, fty, True)
+                            self.game_map.set_buildable(ftx, fty, True)
             player.buildings = [b for b in player.buildings if b.alive]
 
         # Update projectiles
         for proj in self.projectiles:
-            proj.update(dt)
+            proj.update(dt, self)
         self.projectiles = [p for p in self.projectiles if p.alive]
 
         # AI: disabled in multiplayer
@@ -180,6 +197,11 @@ class Game:
 
         # Message timers (stored as (duration, text, team) — team=None shows to all)
         self._messages = [(t - dt, msg, tm) for (t, msg, tm) in self._messages if t > 0]
+
+        # Attack flash events
+        for ev in self.attack_events:
+            ev[3] -= dt
+        self.attack_events = [ev for ev in self.attack_events if ev[3] > 0]
 
     # ================================================================= INPUT
     def handle_event(self, event, ui):
@@ -263,16 +285,13 @@ class Game:
                 else:
                     for ent in list(self.selection):
                         if ent.team == self._my_team:
-                            if isinstance(ent, Building) and ent.is_constructed and ent.btype == 'gate':
-                                for ftx, fty in ent.tile_footprint():
-                                    self.game_map.gates.pop((ftx, fty), None)
                             ent.alive = False
                 self.selection = []
                 self._last_delete_t = -99.0
             elif self.selection:
                 self._last_delete_t = t
                 self._add_message("Press Delete again to delete selection", duration=2.0)
-        elif k == pygame.K_s and not mod:
+        elif k == pygame.K_x and not mod:
             self._cmd_selection(CmdData(Cmd.STOP))
         elif k == pygame.K_a and not mod:
             self._pending_attack_move = True
@@ -332,8 +351,7 @@ class Game:
         # Attack-move: left click also counts as target
         if self._pending_attack_move and not ui.is_over_ui(pos):
             self._pending_attack_move = False
-            wx = (pos[0] - VIEWPORT_X) + self.cam_x
-            wy = (pos[1] - VIEWPORT_Y) + self.cam_y
+            wx, wy = self._screen_to_world(pos)
             for ent in self.selection:
                 if isinstance(ent, Unit) and ent.team == self._my_team:
                     self._issue_cmd(ent, CmdData(Cmd.ATTACK_MOVE, wx=wx, wy=wy))
@@ -353,9 +371,13 @@ class Game:
 
         self.drag_start = None
 
+    def _screen_to_world(self, pos):
+        """Convert game-space screen position to world pixel coordinates."""
+        return ((pos[0] - VIEWPORT_X) / self.zoom + self.cam_x,
+                (pos[1] - VIEWPORT_Y) / self.zoom + self.cam_y)
+
     def _click_select(self, pos, mods):
-        wx = (pos[0] - VIEWPORT_X) + self.cam_x
-        wy = (pos[1] - VIEWPORT_Y) + self.cam_y
+        wx, wy = self._screen_to_world(pos)
         tx = int(wx // TILE_SIZE)
         ty = int(wy // TILE_SIZE)
 
@@ -374,6 +396,7 @@ class Game:
             if hit not in self.selection:
                 hit.selected = True
                 self.selection.append(hit)
+                sounds.play('unit_select')
         elif hit is None:
             node = self.game_map.get_resource(tx, ty)
             if node and not node.depleted and self.game_map.is_explored(tx, ty):
@@ -388,17 +411,9 @@ class Game:
                 e.selected = False
             self.selection = []
 
-        # Viewport-relative rect
-        rx1 = min(start[0], end[0]) - VIEWPORT_X
-        ry1 = min(start[1], end[1]) - VIEWPORT_Y
-        rx2 = max(start[0], end[0]) - VIEWPORT_X
-        ry2 = max(start[1], end[1]) - VIEWPORT_Y
-
-        # Convert to world space
-        wx1 = rx1 + self.cam_x
-        wy1 = ry1 + self.cam_y
-        wx2 = rx2 + self.cam_x
-        wy2 = ry2 + self.cam_y
+        # Convert screen rect to world space (zoom-aware)
+        wx1, wy1 = self._screen_to_world((min(start[0], end[0]), min(start[1], end[1])))
+        wx2, wy2 = self._screen_to_world((max(start[0], end[0]), max(start[1], end[1])))
 
         for unit in self.players[self._my_team].units:
             if unit.alive and wx1 <= unit.x <= wx2 and wy1 <= unit.y <= wy2:
@@ -423,8 +438,7 @@ class Game:
             self.build_mode = None
             return
 
-        wx = (pos[0] - VIEWPORT_X) + self.cam_x
-        wy = (pos[1] - VIEWPORT_Y) + self.cam_y
+        wx, wy = self._screen_to_world(pos)
         tx = int(wx // TILE_SIZE)
         ty = int(wy // TILE_SIZE)
 
@@ -476,6 +490,7 @@ class Game:
                 self._issue_cmd(ent, CmdData(Cmd.GATHER, resource=resource), queue)
             else:
                 self._issue_cmd(ent, CmdData(Cmd.MOVE, wx=wx, wy=wy), queue)
+                sounds.play('unit_move')
 
     # ---------------------------------------------------------------- UI actions
     def _handle_ui_action(self, action):
@@ -510,7 +525,12 @@ class Game:
                         'team': self._my_team,
                     })
                 else:
-                    bld.train_unit(action.utype, self.players[self._my_team])
+                    ok, reason = bld.can_train(action.utype, self.players[self._my_team])
+                    if ok:
+                        bld.train_unit(action.utype, self.players[self._my_team])
+                    else:
+                        self._add_message(reason)
+                        sounds.play('error')
 
         elif action.kind == UIAction.RESEARCH_TECH:
             bld = getattr(action, 'building', None)
@@ -525,7 +545,12 @@ class Game:
                         'team': self._my_team,
                     })
                 else:
-                    bld.start_research(action.tech, self.players[self._my_team])
+                    ok, reason = bld.can_research(action.tech, self.players[self._my_team])
+                    if ok:
+                        bld.start_research(action.tech, self.players[self._my_team])
+                    else:
+                        self._add_message(reason)
+                        sounds.play('error')
 
         elif action.kind == UIAction.CANCEL_QUEUE:
             bld = getattr(action, 'building', None)
@@ -583,8 +608,7 @@ class Game:
 
     # ---------------------------------------------------------------- build placement
     def _try_place_building(self, pos, keep_mode=False):
-        wx = (pos[0] - VIEWPORT_X) + self.cam_x
-        wy = (pos[1] - VIEWPORT_Y) + self.cam_y
+        wx, wy = self._screen_to_world(pos)
         snap_tx = int(wx // TILE_SIZE)
         snap_ty = int(wy // TILE_SIZE)
 
@@ -609,10 +633,12 @@ class Game:
         player = self.players[self._my_team]
         if not player.can_afford_building(self.build_mode):
             self._add_message("Not enough resources!")
+            sounds.play('error')
             return
 
         if not self.can_place_building(self.build_mode, snap_tx, snap_ty):
             self._add_message("Cannot build here!")
+            sounds.play('error')
             return
 
         player.pay_building(self.build_mode)
@@ -623,6 +649,7 @@ class Game:
             if workers:
                 workers[0].give_command(CmdData(Cmd.BUILD, building=bld))
             self._add_message(f"Building {self.build_mode.replace('_',' ').title()}...")
+            sounds.play('building_start')
 
         if not keep_mode:
             self.build_mode = None
@@ -648,6 +675,10 @@ class Game:
     def spawn_projectile(self, x, y, target, damage):
         self.projectiles.append(Projectile(x, y, target, damage))
 
+    def add_attack_event(self, wx, wy, team_attacked):
+        """Record a hit position for the screen-flash and minimap dot effect."""
+        self.attack_events.append([wx, wy, team_attacked, 1.5])
+
     # ================================================================= QUERIES
     def all_units(self):
         """Iterate every living unit across all teams."""
@@ -655,6 +686,23 @@ class Game:
             for unit in player.units:
                 if unit.alive:
                     yield unit
+
+    def idle_workers(self, team):
+        """Return list of idle workers for the given team."""
+        return [u for u in self.players[team].units
+                if u.alive and u.utype == 'worker' and u.state == 'idle']
+
+    def gatherer_counts(self, team):
+        """Return (wood_gatherers, gold_gatherers) for the given team."""
+        wood = sum(1 for u in self.players[team].units
+                   if u.alive and u.utype == 'worker'
+                   and u.state in ('gathering', 'returning')
+                   and u.last_node and u.last_node.type == 'wood')
+        gold = sum(1 for u in self.players[team].units
+                   if u.alive and u.utype == 'worker'
+                   and u.state in ('gathering', 'returning')
+                   and u.last_node and u.last_node.type == 'gold')
+        return wood, gold
 
     def can_place_building(self, btype, tx, ty):
         w, h = BUILDING_SIZES.get(btype, (2, 2))
@@ -704,11 +752,17 @@ class Game:
                     return bld
         return None
 
-    def nearest_storage(self, tx, ty, team):
-        """Find nearest town_hall for the given team."""
+    def nearest_storage(self, tx, ty, team, rtype=None):
+        """Find nearest storage building for the given team.
+        rtype='wood' also checks lumber_mill; rtype='gold' also checks mine."""
+        storage_btypes = {'town_hall'}
+        if rtype == 'wood':
+            storage_btypes.add('lumber_mill')
+        elif rtype == 'gold':
+            storage_btypes.add('mine')
         best, best_d = None, float('inf')
         for bld in self.players[team].buildings:
-            if bld.btype == 'town_hall' and bld.alive and bld.is_constructed:
+            if bld.btype in storage_btypes and bld.alive and bld.is_constructed:
                 d = math.hypot(bld.tx - tx, bld.ty - ty)
                 if d < best_d:
                     best_d, best = d, bld
@@ -745,9 +799,11 @@ class Game:
         if not p_alive:
             self.game_over  = True
             self.player_won = False
+            sounds.play('defeat')
         elif not ai_alive:
             self.game_over  = True
             self.player_won = True
+            sounds.play('victory')
 
     # ================================================================= MESSAGES
     def _add_message(self, text, duration=3.0):
