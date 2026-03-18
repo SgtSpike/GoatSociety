@@ -7,7 +7,7 @@ academy + research, tower defence, smarter attack targeting, reactive defence.
 import random
 import math
 from commands import Cmd, CmdData
-from constants import (TILE_SIZE, MAP_W, MAP_H, AI_TEAM, PLAYER_TEAM,
+from constants import (TILE_SIZE, MAP_W, MAP_H, AI_TEAM, PLAYER_TEAM, NEUTRAL_TEAM,
                        BUILDING_COSTS, UNIT_COSTS, TECH_COSTS)
 from buildings import Building
 from units import Unit, State
@@ -31,6 +31,10 @@ class AIController:
         self._build_cd       = 0.0
         self._research_cd    = 0.0
         self._defend_cd      = 0.0
+        # Difficulty multipliers (set by game after creation)
+        self.resource_mult   = 1.0   # bonus resources per gather
+        self.train_mult      = 1.0   # training speed multiplier
+        self.attack_delay    = 1.0   # attack interval multiplier
 
     def update(self, dt, game):
         self.timer        += dt
@@ -221,16 +225,19 @@ class AIController:
     # ---------------------------------------------------------------- defence
     def _maybe_defend(self, game, player):
         """If the AI base is under attack, rally nearby fighters to defend."""
-        enemy_player = game.players[PLAYER_TEAM]
         th = next((b for b in player.buildings if b.btype == 'town_hall' and b.alive), None)
         if th is None:
             return
 
-        # Check for enemy units near our base
+        # Check for enemy units near our base (from any enemy team)
         base_cx, base_cy = th.x, th.y
         DEFEND_RADIUS = 12 * TILE_SIZE
-        threats = [u for u in enemy_player.units
-                   if u.alive and math.hypot(u.x - base_cx, u.y - base_cy) < DEFEND_RADIUS]
+        threats = []
+        for tid, p in game.players.items():
+            if tid == self.team or tid == NEUTRAL_TEAM:
+                continue
+            threats.extend(u for u in p.units
+                           if u.alive and math.hypot(u.x - base_cx, u.y - base_cy) < DEFEND_RADIUS)
         if not threats:
             return
 
@@ -244,7 +251,7 @@ class AIController:
 
     # ---------------------------------------------------------------- attack
     def _maybe_attack(self, game, player):
-        interval = max(40.0, self.attack_interval - self.wave_num * 6)
+        interval = max(40.0, self.attack_interval - self.wave_num * 6) * self.attack_delay
         if self.attack_timer < interval:
             return
         self.attack_timer = 0.0
@@ -258,15 +265,22 @@ class AIController:
         if len(fighters) < min_needed:
             return
 
-        enemy_player = game.players[PLAYER_TEAM]
         # Target the closest enemy building to our fighters' centroid
         if not fighters:
             return
         cx = sum(u.x for u in fighters) / len(fighters)
         cy = sum(u.y for u in fighters) / len(fighters)
-        targets = [b for b in enemy_player.buildings if b.alive and b.is_constructed]
+        # Gather targets from all enemy teams
+        targets = []
+        for tid, p in game.players.items():
+            if tid == self.team or tid == NEUTRAL_TEAM:
+                continue
+            targets.extend(b for b in p.buildings if b.alive and b.is_constructed)
         if not targets:
-            targets = [b for b in enemy_player.buildings if b.alive]
+            for tid, p in game.players.items():
+                if tid == self.team or tid == NEUTRAL_TEAM:
+                    continue
+                targets.extend(b for b in p.buildings if b.alive)
         if not targets:
             return
         target_bld = min(targets, key=lambda b: math.hypot(b.x - cx, b.y - cy))

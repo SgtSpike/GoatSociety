@@ -8,7 +8,7 @@ from collections import deque
 from constants import (TILE_SIZE, MAP_W, MAP_H, SCREEN_W, SCREEN_H,
                        VIEWPORT_X, VIEWPORT_Y, VIEWPORT_W, VIEWPORT_H,
                        TOP_BAR_H, BOTTOM_PANEL_H,
-                       PLAYER_TEAM, AI_TEAM, TEAM_COLORS,
+                       PLAYER_TEAM, AI_TEAM, NEUTRAL_TEAM, TEAM_COLORS,
                        CAMERA_SPEED, EDGE_SCROLL_MARGIN,
                        BUILDING_SIZES, BUILDING_COSTS,
                        UNIT_STATS, UNIT_COSTS)
@@ -29,7 +29,7 @@ except Exception:
 
 
 class Game:
-    def __init__(self, seed=None):
+    def __init__(self, seed=None, config=None):
         # Reset entity ID counter so host and client produce matching IDs
         Entity._id_ctr = 0
 
@@ -38,15 +38,45 @@ class Game:
         self.net_my_team  = PLAYER_TEAM   # 0 for host/singleplayer, 1 for client
         self._net_session = None
 
-        self.seed  = seed or random.randint(0, 99999)
-        self.game_map = GameMap(seed=self.seed)
+        # Game configuration
+        self.config = config or {}
+        self.num_players = self.config.get('num_players', 2)
+        self.game_mode = self.config.get('game_mode', 'standard')
+        self.ai_difficulty = self.config.get('ai_difficulty', 'normal')
 
-        self.players = {
-            PLAYER_TEAM: Player(PLAYER_TEAM),
-            AI_TEAM:     Player(AI_TEAM),
-        }
+        # Map size from config
+        map_size = self.config.get('map_size', 'medium')
+        if map_size == 'small':
+            self._map_w, self._map_h = 80, 60
+        elif map_size == 'large':
+            self._map_w, self._map_h = 160, 120
+        else:
+            self._map_w, self._map_h = MAP_W, MAP_H
+
+        self.seed  = seed or random.randint(0, 99999)
+        # Compute start positions for map clearing
+        mw, mh = self._map_w, self._map_h
+        _all_positions = [
+            (6, 6), (mw - 10, mh - 9), (mw - 10, 6),
+            (6, mh - 9), (mw // 2, 6), (mw // 2, mh - 9),
+        ]
+        self.game_map = GameMap(seed=self.seed,
+                                width=mw, height=mh,
+                                start_positions=_all_positions[:self.num_players])
+
+        # Create players: team 0 is human, teams 1+ are AI
+        self.players = {PLAYER_TEAM: Player(PLAYER_TEAM)}
+        for t in range(1, self.num_players):
+            self.players[t] = Player(t)
+        self.players[NEUTRAL_TEAM] = Player(NEUTRAL_TEAM)
+
+        # Neutral camps: [(cx_tile, cy_tile, captured_by_team_or_None)]
+        self.neutral_camps = []
+        self._camp_income_timer = 0.0
 
         self.projectiles   = []
+        self.dead_effects  = []   # [(x, y, utype/btype, team, timer, is_unit)]
+        self.particles     = []   # [(x, y, color, size, life, max_life, vx, vy)]
         self.selection     = []
         self.drag_start    = None  # screen coords (x, y) or None
         self.build_mode    = None  # building type string or None
@@ -64,12 +94,46 @@ class Game:
         # Control groups  {1-9: [entity, ...]}
         self._ctrl_groups = {}
 
-        self.ai_controller = AIController(AI_TEAM)
+        # Create AI controllers for all AI teams
+        self.ai_controllers = []
+        for t in range(1, self.num_players):
+            ai = AIController(t)
+            # Apply difficulty settings
+            if self.ai_difficulty == 'easy':
+                ai.attack_interval = 120.0
+                ai.attack_delay = 1.5
+            elif self.ai_difficulty == 'hard':
+                ai.attack_interval = 50.0
+                ai.attack_delay = 0.7
+                # Give hard AI a resource bonus
+                self.players[t].wood += 100
+                self.players[t].gold += 100
+            self.ai_controllers.append(ai)
 
         # Tech bonuses per team
         self._tech_bonuses = {0: {}, 1: {}}
 
+        # King of the Hill state
+        self._koth_control = {}  # {team_id: seconds_held}
+        self._koth_winner = None
+        self._koth_time_to_win = 180.0  # 3 minutes of control to win
+        self._koth_cx = self._map_w // 2  # hill center tile
+        self._koth_cy = self._map_h // 2
+        self._koth_radius = 6  # tiles
+
+        # Survival state
+        self._survival_wave = 0
+        self._survival_timer = 0.0
+        # Base interval between waves depends on difficulty
+        if self.ai_difficulty == 'easy':
+            self._survival_interval = 300.0    # 5 minutes
+        elif self.ai_difficulty == 'hard':
+            self._survival_interval = 180.0    # 3 minutes
+        else:
+            self._survival_interval = 240.0    # 4 minutes (normal)
+
         self._pending_attack_move = False
+        self._pending_patrol = False
         self.selected_resource = None   # ResourceNode clicked for inspection
         self._active_cmd_team = None    # team context for message tagging
 
@@ -83,6 +147,10 @@ class Game:
         self._konami_buf  = []
         self._goat_mode_t = 0.0   # seconds remaining of SUPREME GOAT MODE
         self._last_delete_t = -99.0  # double-delete confirmation timer
+        self._last_click_t  = -99.0  # double-click detection timer
+        self._last_click_pos = (0, 0)
+        self._request_load  = False  # set True by F9 to signal main loop
+        self.paused         = False  # toggled by Escape
 
         self._setup_start()
 
@@ -93,14 +161,28 @@ class Game:
 
     # ================================================================= SETUP
     def _setup_start(self):
-        """Place starting units and buildings for both players."""
-        # Player starts top-left
-        p_tx, p_ty = 6, 6
-        self._place_start(PLAYER_TEAM, p_tx, p_ty)
-        # AI starts bottom-right
-        a_tx, a_ty = MAP_W - 10, MAP_H - 9
-        self._place_start(AI_TEAM, a_tx, a_ty)
+        """Place starting units and buildings for all players."""
+        mw = self._map_w
+        mh = self._map_h
+        # Start positions for up to 6 players (spread around map edges)
+        positions = [
+            (6, 6),                    # top-left (player)
+            (mw - 10, mh - 9),         # bottom-right
+            (mw - 10, 6),              # top-right
+            (6, mh - 9),               # bottom-left
+            (mw // 2, 6),              # top-center
+            (mw // 2, mh - 9),         # bottom-center
+        ]
+        for team_id in range(self.num_players):
+            if team_id < len(positions):
+                tx, ty = positions[team_id]
+                self._place_start(team_id, tx, ty)
+
+        # Neutral camps (placed in mid-map areas)
+        self._place_neutral_camps()
+
         # Center camera on player start
+        p_tx, p_ty = positions[0]
         self.cam_x = p_tx * TILE_SIZE - VIEWPORT_W // 2
         self.cam_y = p_ty * TILE_SIZE - VIEWPORT_H // 2
         self._clamp_camera()
@@ -124,17 +206,91 @@ class Game:
                             team)
 
         # Kick off AI workers gathering
-        if team == AI_TEAM:
-            for u in self.players[AI_TEAM].units:
+        if team != PLAYER_TEAM and team != NEUTRAL_TEAM:
+            for u in self.players[team].units:
                 node = self.game_map.find_nearest_resource(u.tx, u.ty, 'gold')
                 if node is None:
                     node = self.game_map.find_nearest_resource(u.tx, u.ty, 'wood')
                 if node:
                     u.give_command(CmdData(Cmd.GATHER, resource=node))
 
+    def _place_neutral_camps(self):
+        """Place 4 neutral camps in mid-map areas with 2-3 wild goat defenders."""
+        rng = random.Random(self.seed + 777)
+        mw, mh = self._map_w, self._map_h
+        camp_positions = [
+            (mw // 4, mh // 4),
+            (mw * 3 // 4, mh // 4),
+            (mw // 4, mh * 3 // 4),
+            (mw * 3 // 4, mh * 3 // 4),
+        ]
+        for cx, cy in camp_positions:
+            cx += rng.randint(-6, 6)
+            cy += rng.randint(-6, 6)
+            cx = max(10, min(mw - 10, cx))
+            cy = max(10, min(mh - 10, cy))
+
+            self.neutral_camps.append([cx, cy, None])  # None = uncaptured
+
+            # Spawn 2-3 neutral soldier goats
+            count = rng.randint(2, 3)
+            for i in range(count):
+                ox = cx + rng.randint(-2, 2)
+                oy = cy + rng.randint(-2, 2)
+                while not self.game_map.is_passable(ox, oy):
+                    ox += 1
+                    if ox >= self._map_w - 1:
+                        ox = cx
+                        break
+                self.spawn_unit('soldier',
+                                ox * TILE_SIZE + TILE_SIZE // 2,
+                                oy * TILE_SIZE + TILE_SIZE // 2,
+                                NEUTRAL_TEAM)
+
+    def _update_neutral_camps(self, dt):
+        """Check if camps are captured and provide passive income."""
+        self._camp_income_timer += dt
+
+        for camp in self.neutral_camps:
+            cx, cy, captured = camp[0], camp[1], camp[2]
+
+            if captured is not None:
+                continue  # Already captured
+
+            # Check if all neutral units near the camp are dead
+            camp_wx = cx * TILE_SIZE + TILE_SIZE // 2
+            camp_wy = cy * TILE_SIZE + TILE_SIZE // 2
+            radius = 6 * TILE_SIZE
+            alive_neutrals = [u for u in self.players[NEUTRAL_TEAM].units
+                              if u.alive and
+                              math.hypot(u.x - camp_wx, u.y - camp_wy) < radius]
+
+            if not alive_neutrals:
+                # Find which team has units closest to claim it
+                best_team = None
+                best_dist = float('inf')
+                for team_id in range(self.num_players):
+                    for u in self.players[team_id].units:
+                        if u.alive:
+                            d = math.hypot(u.x - camp_wx, u.y - camp_wy)
+                            if d < radius and d < best_dist:
+                                best_dist = d
+                                best_team = team_id
+                if best_team is not None:
+                    camp[2] = best_team
+                    if best_team == self._my_team:
+                        self._add_message("Neutral camp captured! +5 gold/min")
+
+        # Passive income every 12 seconds (= 5 gold/min)
+        if self._camp_income_timer >= 12.0:
+            self._camp_income_timer = 0.0
+            for camp in self.neutral_camps:
+                if camp[2] is not None:
+                    self.players[camp[2]].gold += 5
+
     # ================================================================= UPDATE
     def update(self, dt):
-        if self.game_over:
+        if self.game_over or self.paused:
             return
         self.time_elapsed += dt
 
@@ -147,13 +303,13 @@ class Game:
                         u.speed_bonus = max(0, u.speed_bonus - 120)
                 self._add_message("Goat mode over. They're tired now.", duration=3.0)
 
-        p = self.players[PLAYER_TEAM]
-        p.update_food_cap()
-        p.recompute_food()
-        self.players[AI_TEAM].update_food_cap()
-        self.players[AI_TEAM].recompute_food()
+        # Update food for all players
+        for player in self.players.values():
+            player.update_food_cap()
+            player.recompute_food()
 
-        # Update map visibility
+        # Update map visibility (player team only)
+        p = self.players[PLAYER_TEAM]
         self.game_map.update_visibility(p.units, p.buildings)
 
         # Update units
@@ -161,6 +317,10 @@ class Game:
             for unit in list(player.units):
                 if unit.alive:
                     unit.update(dt, self)
+            for unit in player.units:
+                if not unit.alive:
+                    self.dead_effects.append([unit.x, unit.y, unit.utype,
+                                              unit.team, 2.0, True])
             player.units = [u for u in player.units if u.alive]
 
         # Update buildings
@@ -171,6 +331,10 @@ class Game:
             # Restore passability for any building that just died
             for bld in player.buildings:
                 if not bld.alive and bld.is_constructed:
+                    self.dead_effects.append([bld.x, bld.y, bld.btype,
+                                              bld.team, 4.0, False,
+                                              bld._tx, bld._ty,
+                                              bld.w_tiles, bld.h_tiles])
                     if bld.btype == 'gate':
                         for ftx, fty in bld.tile_footprint():
                             self.game_map.gates.pop((ftx, fty), None)
@@ -185,9 +349,19 @@ class Game:
             proj.update(dt, self)
         self.projectiles = [p for p in self.projectiles if p.alive]
 
-        # AI: disabled in multiplayer
-        if self.net_mode is None:
-            self.ai_controller.update(dt, self)
+        # Neutral camps
+        self._update_neutral_camps(dt)
+
+        # Game mode updates
+        if self.game_mode == 'king_of_hill':
+            self._update_koth(dt)
+        elif self.game_mode == 'survival':
+            self._update_survival(dt)
+
+        # AI: run on host and singleplayer (human teams' controllers already removed)
+        if self.net_mode != 'client':
+            for ai in self.ai_controllers:
+                ai.update(dt, self)
 
         # Clean selection
         self.selection = [e for e in self.selection if e.alive]
@@ -197,6 +371,19 @@ class Game:
 
         # Message timers (stored as (duration, text, team) — team=None shows to all)
         self._messages = [(t - dt, msg, tm) for (t, msg, tm) in self._messages if t > 0]
+
+        # Update particles
+        for p in self.particles:
+            p[0] += p[6] * dt   # x += vx * dt
+            p[1] += p[7] * dt   # y += vy * dt
+            p[7] += 80 * dt     # gravity
+            p[4] -= dt           # life -= dt
+        self.particles = [p for p in self.particles if p[4] > 0]
+
+        # Dead entity fade effects
+        for de in self.dead_effects:
+            de[4] -= dt
+        self.dead_effects = [de for de in self.dead_effects if de[4] > 0]
 
         # Attack flash events
         for ev in self.attack_events:
@@ -211,8 +398,13 @@ class Game:
 
         if event.type == pygame.KEYDOWN:
             self._on_keydown(event, ui)
+            if self.paused:
+                return  # only allow keyboard (for unpause) while paused
 
-        elif event.type == pygame.MOUSEBUTTONDOWN:
+        if self.paused:
+            return
+
+        if event.type == pygame.MOUSEBUTTONDOWN:
             pos = event.pos
             if event.button == 1:  # Left click
                 if ui.is_over_ui(pos):
@@ -253,8 +445,8 @@ class Game:
         self._clamp_camera()
 
     def _clamp_camera(self):
-        max_x = MAP_W * TILE_SIZE - VIEWPORT_W
-        max_y = MAP_H * TILE_SIZE - VIEWPORT_H
+        max_x = self._map_w * TILE_SIZE - VIEWPORT_W
+        max_y = self._map_h * TILE_SIZE - VIEWPORT_H
         self.cam_x = max(0, min(max_x, self.cam_x))
         self.cam_y = max(0, min(max_y, self.cam_y))
 
@@ -266,8 +458,12 @@ class Game:
         if k == pygame.K_ESCAPE:
             if self.build_mode:
                 self.build_mode = None
-            else:
+            elif self.selection:
+                for e in self.selection:
+                    e.selected = False
                 self.selection = []
+            else:
+                self.paused = not self.paused
         elif k == pygame.K_DELETE:
             t = self.time_elapsed
             if t - self._last_delete_t < 0.5 and self.selection:
@@ -295,6 +491,8 @@ class Game:
             self._cmd_selection(CmdData(Cmd.STOP))
         elif k == pygame.K_a and not mod:
             self._pending_attack_move = True
+        elif k == pygame.K_p and not mod:
+            self._pending_patrol = True
         elif k == pygame.K_b and not mod:
             pass   # build menu shown in UI automatically when worker selected
         elif k == pygame.K_SPACE:
@@ -311,6 +509,14 @@ class Game:
             else:
                 grp = self._ctrl_groups.get(n, [])
                 self.selection = [e for e in grp if e.alive]
+
+        elif k == pygame.K_F5:
+            from savegame import save_game
+            path = save_game(self)
+            self._add_message("Game saved!", duration=2.0)
+        elif k == pygame.K_F9:
+            # Quick-load handled by main loop (sets a flag)
+            self._request_load = True
 
         # Track Konami code: ↑ ↑ ↓ ↓ ← → ← →
         _KONAMI = [pygame.K_UP, pygame.K_UP, pygame.K_DOWN, pygame.K_DOWN,
@@ -358,6 +564,16 @@ class Game:
             self.drag_start = None
             return
 
+        # Patrol: left click sets patrol destination
+        if self._pending_patrol and not ui.is_over_ui(pos):
+            self._pending_patrol = False
+            wx, wy = self._screen_to_world(pos)
+            for ent in self.selection:
+                if isinstance(ent, Unit) and ent.team == self._my_team:
+                    self._issue_cmd(ent, CmdData(Cmd.PATROL, wx=wx, wy=wy))
+            self.drag_start = None
+            return
+
         if self.drag_start is None:
             return
 
@@ -381,6 +597,14 @@ class Game:
         tx = int(wx // TILE_SIZE)
         ty = int(wy // TILE_SIZE)
 
+        # Double-click detection
+        now = self.time_elapsed
+        is_double = (now - self._last_click_t < 0.35 and
+                     abs(pos[0] - self._last_click_pos[0]) < 8 and
+                     abs(pos[1] - self._last_click_pos[1]) < 8)
+        self._last_click_t = now
+        self._last_click_pos = pos
+
         # Try own team first, then anything
         hit = self._entity_at(wx, wy, team=self._my_team)
         if hit is None:
@@ -393,7 +617,21 @@ class Game:
 
         if hit and hit.team == self._my_team:
             self.selected_resource = None
-            if hit not in self.selection:
+            # Double-click: select all visible units of same type on screen
+            if is_double and isinstance(hit, Unit):
+                utype = hit.utype
+                z = self.zoom
+                vw = VIEWPORT_W / z
+                vh = VIEWPORT_H / z
+                for u in self.players[self._my_team].units:
+                    if (u.alive and u.utype == utype and
+                            self.cam_x <= u.x <= self.cam_x + vw and
+                            self.cam_y <= u.y <= self.cam_y + vh and
+                            u not in self.selection):
+                        u.selected = True
+                        self.selection.append(u)
+                sounds.play('unit_select')
+            elif hit not in self.selection:
                 hit.selected = True
                 self.selection.append(hit)
                 sounds.play('unit_select')
@@ -504,6 +742,9 @@ class Game:
 
         elif action.kind == UIAction.ATTACK_MOVE:
             self._pending_attack_move = True
+
+        elif action.kind == UIAction.PATROL:
+            self._pending_patrol = True
 
         elif action.kind == UIAction.BUILD_MODE:
             if hasattr(action, 'btype'):
@@ -678,6 +919,25 @@ class Game:
     def add_attack_event(self, wx, wy, team_attacked):
         """Record a hit position for the screen-flash and minimap dot effect."""
         self.attack_events.append([wx, wy, team_attacked, 1.5])
+        # Spawn hit particles
+        for _ in range(4):
+            vx = random.uniform(-40, 40)
+            vy = random.uniform(-60, -10)
+            col = random.choice([(220, 50, 30), (255, 160, 40), (200, 80, 60)])
+            self.particles.append([wx, wy, col, random.uniform(2, 4),
+                                   0.4, 0.4, vx, vy])
+
+    def spawn_gather_particles(self, x, y, rtype):
+        """Spawn sparkle particles at a gathering site."""
+        if rtype == 'wood':
+            colors = [(160, 120, 50), (120, 90, 30), (180, 150, 80)]
+        else:
+            colors = [(240, 200, 40), (255, 230, 80), (200, 170, 30)]
+        for _ in range(3):
+            vx = random.uniform(-30, 30)
+            vy = random.uniform(-50, -15)
+            self.particles.append([x, y, random.choice(colors),
+                                   random.uniform(1.5, 3), 0.5, 0.5, vx, vy])
 
     # ================================================================= QUERIES
     def all_units(self):
@@ -786,22 +1046,114 @@ class Game:
             unit.armor_bonus  = bonuses.get('armor', 0)
             unit.gather_bonus = bonuses.get('gather', 0)
 
+    # ================================================================= GAME MODES
+    def _update_koth(self, dt):
+        """King of the Hill: control the center for 3 minutes to win."""
+        cx = self._koth_cx * TILE_SIZE + TILE_SIZE // 2
+        cy = self._koth_cy * TILE_SIZE + TILE_SIZE // 2
+        radius = self._koth_radius * TILE_SIZE
+
+        # Count military units in the hill zone per team
+        counts = {}
+        for team_id in range(self.num_players):
+            counts[team_id] = sum(
+                1 for u in self.players[team_id].units
+                if u.alive and u.utype != 'worker'
+                and math.hypot(u.x - cx, u.y - cy) < radius)
+
+        # Determine controlling team (must have exclusive presence)
+        controlling = None
+        for team_id, cnt in counts.items():
+            if cnt > 0:
+                if controlling is None:
+                    controlling = team_id
+                else:
+                    controlling = None  # contested
+                    break
+
+        if controlling is not None:
+            self._koth_control[controlling] = self._koth_control.get(controlling, 0.0) + dt
+            if self._koth_control[controlling] >= self._koth_time_to_win:
+                self.game_over = True
+                self.player_won = (controlling == self._my_team)
+                self._koth_winner = controlling
+                sounds.play('victory' if self.player_won else 'defeat')
+
+    def _update_survival(self, dt):
+        """Survival mode: escalating waves of enemies from map edges."""
+        self._survival_timer += dt
+        interval = max(30.0, self._survival_interval - self._survival_wave * 10)
+        if self._survival_timer < interval:
+            return
+        self._survival_timer = 0.0
+        self._survival_wave += 1
+
+        # Spawn enemies at random map edges
+        rng = random.Random()
+        wave_size = min(4 + self._survival_wave * 2, 20)
+        mw, mh = self._map_w, self._map_h
+
+        for _ in range(wave_size):
+            edge = rng.choice(['top', 'bottom', 'left', 'right'])
+            if edge == 'top':
+                tx, ty = rng.randint(5, mw - 5), 1
+            elif edge == 'bottom':
+                tx, ty = rng.randint(5, mw - 5), mh - 2
+            elif edge == 'left':
+                tx, ty = 1, rng.randint(5, mh - 5)
+            else:
+                tx, ty = mw - 2, rng.randint(5, mh - 5)
+
+            # Escalate unit types with wave number
+            if self._survival_wave >= 6:
+                utype = rng.choice(['soldier', 'archer', 'knight'])
+            elif self._survival_wave >= 3:
+                utype = rng.choice(['soldier', 'archer'])
+            else:
+                utype = 'soldier'
+
+            # Spawn for the highest AI team (dedicated survival enemy)
+            enemy_team = self.num_players - 1
+            if enemy_team < 1:
+                enemy_team = 1
+            u = self.spawn_unit(utype,
+                                tx * TILE_SIZE + TILE_SIZE // 2,
+                                ty * TILE_SIZE + TILE_SIZE // 2,
+                                enemy_team)
+            if u:
+                # Attack-move toward player base
+                p_th = next((b for b in self.players[PLAYER_TEAM].buildings
+                             if b.btype == 'town_hall' and b.alive), None)
+                if p_th:
+                    u.give_command(CmdData(Cmd.ATTACK, target=p_th))
+
+        self._add_message(f"Wave {self._survival_wave}!", duration=3.0)
+
     # ================================================================= WIN/LOSE
     def _check_game_over(self):
         if self.game_over:
             return
 
-        p_alive  = any(b.btype == 'town_hall' and b.alive
-                       for b in self.players[PLAYER_TEAM].buildings)
-        ai_alive = any(b.btype == 'town_hall' and b.alive
-                       for b in self.players[AI_TEAM].buildings)
+        p_alive = any(b.btype == 'town_hall' and b.alive
+                      for b in self.players[PLAYER_TEAM].buildings)
 
         if not p_alive:
-            self.game_over  = True
+            self.game_over = True
             self.player_won = False
             sounds.play('defeat')
-        elif not ai_alive:
-            self.game_over  = True
+            return
+
+        # Check if all AI opponents' town halls are destroyed
+        all_ai_dead = True
+        for t in range(1, self.num_players):
+            if t in self.players:
+                if any(b.btype == 'town_hall' and b.alive
+                       for b in self.players[t].buildings):
+                    all_ai_dead = False
+                    break
+
+        if all_ai_dead:
+            self.game_over = True
             self.player_won = True
             sounds.play('victory')
 
@@ -1105,6 +1457,11 @@ class Game:
             if bld:
                 for u in units:
                     u.give_command(CmdData(Cmd.BUILD, building=bld), queue=queue_cmd)
+
+        elif cmd_type == 'patrol':
+            wx, wy = data['wx'], data['wy']
+            for u in units:
+                u.give_command(CmdData(Cmd.PATROL, wx=wx, wy=wy), queue=queue_cmd)
 
         elif cmd_type == 'stop':
             for u in units:

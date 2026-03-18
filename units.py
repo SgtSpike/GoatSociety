@@ -22,6 +22,7 @@ class State:
     GATHERING = 'gathering'
     RETURNING = 'returning'
     BUILDING  = 'building'
+    PATROLLING = 'patrolling'
 
 
 class Unit(Entity):
@@ -73,6 +74,11 @@ class Unit(Entity):
         self.gather_bonus = 0
         self.speed_bonus  = 0
 
+        # patrol
+        self._patrol_a = None  # (wx, wy) - first waypoint
+        self._patrol_b = None  # (wx, wy) - second waypoint
+        self._patrol_to_b = True  # currently heading to B?
+
         # visuals
         self.anim_t = 0.0
         self.flip_h = False
@@ -120,10 +126,17 @@ class Unit(Entity):
         elif cmd.type == Cmd.GATHER:
             self.gather_node = cmd.resource
             self.last_node   = cmd.resource
+            self._path_goal  = None   # clear stale goal so movement isn't skipped
             self.state = State.GATHERING
         elif cmd.type == Cmd.BUILD:
             self.build_target = cmd.building
             self.state = State.BUILDING
+        elif cmd.type == Cmd.PATROL:
+            self._patrol_a = (self.x, self.y)
+            self._patrol_b = (cmd.wx, cmd.wy)
+            self._patrol_to_b = True
+            self._start_move(cmd.wx, cmd.wy)
+            self.state = State.PATROLLING
         elif cmd.type == Cmd.STOP:
             self.state = State.IDLE
             self._path = []
@@ -162,6 +175,8 @@ class Unit(Entity):
             self._update_return(dt, game)
         elif self.state == State.BUILDING:
             self._update_build(dt, game)
+        elif self.state == State.PATROLLING:
+            self._update_patrol(dt, game)
 
         self._apply_separation(dt, game)
 
@@ -399,6 +414,10 @@ class Unit(Entity):
                     self.carry_gold += taken
                     if self.team == PLAYER_TEAM:
                         sounds.play('clink')
+                game.spawn_gather_particles(
+                    node.tx * TILE_SIZE + TILE_SIZE // 2,
+                    node.ty * TILE_SIZE + TILE_SIZE // 2,
+                    node.type)
                 if node.depleted:
                     sounds.play('resource_depleted')
                 self.state = State.RETURNING
@@ -523,6 +542,44 @@ class Unit(Entity):
                 else:
                     self.state = State.IDLE
                     self._next_command()
+
+    # --------------------------------------------------------------- patrol
+    def _update_patrol(self, dt, game):
+        # Auto-attack enemies in sight while patrolling
+        en = self._nearest_enemy(game)
+        if en and self.distance_to(en) <= self.attack_range + TILE_SIZE:
+            self.atk_target = en
+            self.state = State.ATTACKING
+            # After killing, resume patrol via queued command
+            self.cmd_queue.appendleft(CmdData(Cmd.PATROL,
+                                               wx=self._patrol_b[0] if self._patrol_to_b
+                                               else self._patrol_a[0],
+                                               wy=self._patrol_b[1] if self._patrol_to_b
+                                               else self._patrol_a[1]))
+            return
+
+        # Move toward current patrol target
+        if self._wait_t > 0:
+            self._wait_t -= dt
+            if self._wait_t <= 0:
+                self._needs_path = True
+            return
+
+        if self._needs_path:
+            self._needs_path = False
+            start = (self.tx, self.ty)
+            self._path = pf.astar(game.game_map, start, self._path_goal, self.team)
+            self._path_idx = 0
+
+        if not self._path or self._path_idx >= len(self._path):
+            # Arrived at patrol point: swap direction
+            self._patrol_to_b = not self._patrol_to_b
+            target = self._patrol_b if self._patrol_to_b else self._patrol_a
+            self._start_move(target[0], target[1])
+            self.state = State.PATROLLING
+            return
+
+        self._step_path(dt)
 
     # --------------------------------------------------------------- helpers
     def _nearest_enemy(self, game):

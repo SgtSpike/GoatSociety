@@ -27,9 +27,15 @@ EDGE_SCROLL_MARGIN = 18
 # Teams
 PLAYER_TEAM = 0
 AI_TEAM = 1
+NEUTRAL_TEAM = 99
 TEAM_COLORS = {
-    0: (80, 140, 230),
-    1: (210, 70, 70),
+    0: (80, 140, 230),    # blue (player)
+    1: (210, 70, 70),     # red
+    2: (60, 190, 60),     # green
+    3: (200, 160, 40),    # yellow
+    4: (170, 70, 200),    # purple
+    5: (220, 130, 50),    # orange
+    NEUTRAL_TEAM: (160, 160, 100),   # neutral / wild goats
 }
 
 # Tile types
@@ -119,8 +125,8 @@ BUILDING_HP = {
     'archery_range': 380,
     'academy':       500,
     'tower':         350,
-    'wall':          200,
-    'gate':          150,
+    'wall':          600,
+    'gate':          500,
 }
 
 # Units that each building can train

@@ -53,17 +53,22 @@ class Renderer:
 
         self._draw_tiles(game)
         self._draw_resources(game)
+        self._draw_dead_effects(game)
         self._draw_buildings(game)
         self._draw_units(game)
         self._draw_projectiles(game)
+        self._draw_particles(game)
         self._draw_selection_indicators(game)
         self._draw_health_bars(game)
         self._draw_fog(game)
+        self._draw_neutral_camps(game)
+        if game.game_mode == 'king_of_hill':
+            self._draw_koth_zone(game)
         self._draw_build_ghost(game)
         self._draw_drag_rect(game)
 
         if zoom == 1.0:
-            self._scene.blit(scene, (0, 0))
+            self.vp_surf.blit(scene, (0, 0))
         else:
             pygame.transform.scale(scene, (VIEWPORT_W, VIEWPORT_H), self.vp_surf)
 
@@ -81,8 +86,8 @@ class Renderer:
         cam_x, cam_y = game.cam_x, game.cam_y
         start_tx = max(0, int(cam_x // TILE_SIZE))
         start_ty = max(0, int(cam_y // TILE_SIZE))
-        end_tx   = min(MAP_W, start_tx + sw // TILE_SIZE + 2)
-        end_ty   = min(MAP_H, start_ty + sh // TILE_SIZE + 2)
+        end_tx   = min(game.game_map.width, start_tx + sw // TILE_SIZE + 2)
+        end_ty   = min(game.game_map.height, start_ty + sh // TILE_SIZE + 2)
 
         for tx in range(start_tx, end_tx):
             for ty in range(start_ty, end_ty):
@@ -90,7 +95,8 @@ class Renderer:
                     continue  # will be covered by fog later
                 sx = tx * TILE_SIZE - int(cam_x)
                 sy = ty * TILE_SIZE - int(cam_y)
-                tile_surf = self.assets.get_tile(game.game_map.tiles[tx][ty])
+                tile_surf = self.assets.get_tile(game.game_map.tiles[tx][ty],
+                                                game.time_elapsed)
                 s.blit(tile_surf, (sx, sy))
 
     # ============================================================== RESOURCES
@@ -172,6 +178,22 @@ class Renderer:
                         self._scene.blit(dim, (sx, sy))
                     else:
                         self._scene.blit(surf, (sx, sy))
+
+                # Damage overlay (cracks when < 50% HP, fire when < 25% HP)
+                if visible and bld.hp < bld.max_hp:
+                    hp_ratio = bld.hp / bld.max_hp
+                    dmg_surf = self.assets.get_damage_overlay(
+                        bld.btype if bld.btype != 'wall_v' else 'wall', hp_ratio)
+                    if dmg_surf:
+                        # Animate fire flicker
+                        if hp_ratio < 0.25:
+                            import math as _m
+                            flicker = _m.sin(game.time_elapsed * 8) * 0.15 + 0.85
+                            copy = dmg_surf.copy()
+                            copy.set_alpha(int(255 * flicker))
+                            self._scene.blit(copy, (sx, sy))
+                        else:
+                            self._scene.blit(dmg_surf, (sx, sy))
 
                 if bld.selected:
                     self._draw_selection_rect(sx, sy, pw, ph)
@@ -315,8 +337,8 @@ class Renderer:
         start_tx = max(0, int(cam_x // TILE_SIZE))
         start_ty = max(0, int(cam_y // TILE_SIZE))
         sw_f, sh_f = self._scene.get_size()
-        end_tx   = min(MAP_W, start_tx + sw_f // TILE_SIZE + 2)
-        end_ty   = min(MAP_H, start_ty + sh_f // TILE_SIZE + 2)
+        end_tx   = min(game.game_map.width, start_tx + sw_f // TILE_SIZE + 2)
+        end_ty   = min(game.game_map.height, start_ty + sh_f // TILE_SIZE + 2)
 
         for tx in range(start_tx, end_tx):
             for ty in range(start_ty, end_ty):
@@ -374,6 +396,113 @@ class Renderer:
         drag_surf.fill((0, 255, 0, 25))
         self._scene.blit(drag_surf, (rx, ry))
 
+    # ========================================================= NEUTRAL CAMPS
+    def _draw_neutral_camps(self, game):
+        cam_x, cam_y = game.cam_x, game.cam_y
+        for camp in game.neutral_camps:
+            cx, cy, captured = camp[0], camp[1], camp[2]
+            sx = cx * TILE_SIZE - int(cam_x)
+            sy = cy * TILE_SIZE - int(cam_y)
+            sw, sh = self._scene.get_size()
+            if sx < -50 or sx > sw + 50 or sy < -50 or sy > sh + 50:
+                continue
+            if not game.game_map.is_explored(cx, cy):
+                continue
+
+            # Draw camp marker (small flag/banner)
+            if captured is not None:
+                col = TEAM_COLORS.get(captured, (160, 160, 100))
+            else:
+                col = (160, 160, 100)  # neutral color
+
+            # Flag pole
+            pygame.draw.line(self._scene, (140, 140, 140),
+                             (sx, sy + 10), (sx, sy - 14), 2)
+            # Pennant
+            pygame.draw.polygon(self._scene, col,
+                                [(sx, sy - 14), (sx + 14, sy - 8), (sx, sy - 2)])
+            # Camp circle indicator
+            camp_surf = pygame.Surface((40, 40), pygame.SRCALPHA)
+            pygame.draw.circle(camp_surf, (*col, 40), (20, 20), 20)
+            pygame.draw.circle(camp_surf, (*col, 120), (20, 20), 20, 2)
+            self._scene.blit(camp_surf, (sx - 20, sy - 20))
+
+    # ========================================================= KING OF THE HILL
+    def _draw_koth_zone(self, game):
+        cam_x, cam_y = game.cam_x, game.cam_y
+        cx = game._koth_cx * TILE_SIZE + TILE_SIZE // 2 - int(cam_x)
+        cy = game._koth_cy * TILE_SIZE + TILE_SIZE // 2 - int(cam_y)
+        r = game._koth_radius * TILE_SIZE
+
+        # Translucent circle
+        size = r * 2 + 4
+        surf = pygame.Surface((size, size), pygame.SRCALPHA)
+        # Determine color by controlling team
+        best_team = None
+        best_time = 0
+        for t, secs in game._koth_control.items():
+            if secs > best_time:
+                best_time = secs
+                best_team = t
+        col = TEAM_COLORS.get(best_team, (200, 200, 100)) if best_team is not None else (200, 200, 100)
+        pygame.draw.circle(surf, (*col, 30), (size // 2, size // 2), r)
+        pygame.draw.circle(surf, (*col, 140), (size // 2, size // 2), r, 2)
+        self._scene.blit(surf, (cx - size // 2, cy - size // 2))
+
+        # Progress text
+        if best_team is not None and best_time > 0:
+            pct = int(100 * best_time / game._koth_time_to_win)
+            txt = self.font_sm.render(f"Hill: {pct}%", True, col)
+            self._scene.blit(txt, (cx - txt.get_width() // 2, cy - r - 16))
+
+    # =========================================================== DEAD EFFECTS
+    def _draw_dead_effects(self, game):
+        cam_x, cam_y = game.cam_x, game.cam_y
+        for de in game.dead_effects:
+            is_unit = de[5]
+            timer = de[4]
+            if is_unit:
+                x, y, utype, team = de[0], de[1], de[2], de[3]
+                max_t = 2.0
+                alpha = int(255 * (timer / max_t))
+                surf = self.assets.get_dead_unit(utype, team)
+                if surf:
+                    sx = int(x) - int(cam_x) - TILE_SIZE // 2
+                    sy = int(y) - int(cam_y) - TILE_SIZE // 2
+                    sw, sh = self._scene.get_size()
+                    if sx + TILE_SIZE < 0 or sx > sw or sy + TILE_SIZE < 0 or sy > sh:
+                        continue
+                    copy = surf.copy()
+                    copy.set_alpha(alpha)
+                    self._scene.blit(copy, (sx, sy))
+            else:
+                # Destroyed building rubble
+                x, y, btype, team = de[0], de[1], de[2], de[3]
+                btx, bty = de[6], de[7]
+                w_tiles, h_tiles = de[8], de[9]
+                max_t = 4.0
+                alpha = int(255 * (timer / max_t))
+                rubble = self.assets.get_rubble(btype)
+                if rubble:
+                    sx = btx * TILE_SIZE - int(cam_x)
+                    sy = bty * TILE_SIZE - int(cam_y)
+                    copy = rubble.copy()
+                    copy.set_alpha(alpha)
+                    self._scene.blit(copy, (sx, sy))
+
+    # =========================================================== PARTICLES
+    def _draw_particles(self, game):
+        cam_x, cam_y = game.cam_x, game.cam_y
+        for p in getattr(game, 'particles', []):
+            sx = int(p[0]) - int(cam_x)
+            sy = int(p[1]) - int(cam_y)
+            alpha = int(255 * (p[4] / p[5]))
+            col = (*p[2][:3], alpha) if len(p[2]) >= 3 else (255, 255, 255, alpha)
+            size = max(1, int(p[3] * (p[4] / p[5])))
+            ps = pygame.Surface((size * 2, size * 2), pygame.SRCALPHA)
+            pygame.draw.circle(ps, col, (size, size), size)
+            self._scene.blit(ps, (sx - size, sy - size))
+
     # ======================================================= ATTACK VIGNETTE
     def _draw_attack_vignette(self, game):
         """Flash red border on screen when the player's team is attacked."""
@@ -399,11 +528,12 @@ class Renderer:
     # ============================================================ MINIMAP
     def draw_minimap(self, screen, game, mm_rect):
         """Draw minimap into mm_rect on screen."""
-        mm_surf = pygame.Surface((MAP_W, MAP_H))
+        mw, mh = game.game_map.width, game.game_map.height
+        mm_surf = pygame.Surface((mw, mh))
 
         # Tiles
-        for tx in range(MAP_W):
-            for ty in range(MAP_H):
+        for tx in range(mw):
+            for ty in range(mh):
                 if not game.game_map.is_explored(tx, ty):
                     col = (5, 5, 5)
                 else:
@@ -418,23 +548,23 @@ class Renderer:
 
         # Buildings
         for team_id, player in game.players.items():
-            tc = TEAM_COLORS[team_id]
+            tc = TEAM_COLORS.get(team_id, (100, 100, 100))
             for bld in player.buildings:
                 if not bld.alive:
                     continue
                 if any(game.game_map.is_explored(ftx, fty)
                        for ftx, fty in bld.tile_footprint()):
                     for ftx, fty in bld.tile_footprint():
-                        if 0 <= ftx < MAP_W and 0 <= fty < MAP_H:
+                        if 0 <= ftx < mw and 0 <= fty < mh:
                             mm_surf.set_at((ftx, fty), tc)
 
         # Units
         for team_id, player in game.players.items():
-            tc = TEAM_COLORS[team_id]
+            tc = TEAM_COLORS.get(team_id, (100, 100, 100))
             for unit in player.units:
                 if unit.alive and game.game_map.is_visible(unit.tx, unit.ty):
                     ux, uy = unit.tx, unit.ty
-                    if 0 <= ux < MAP_W and 0 <= uy < MAP_H:
+                    if 0 <= ux < mw and 0 <= uy < mh:
                         mm_surf.set_at((ux, uy), tc)
 
         # Attack event dots (shown before scaling so they're sharp)
@@ -442,13 +572,23 @@ class Renderer:
             wx, wy, _team, timer = ev
             dot_tx = int(wx // TILE_SIZE)
             dot_ty = int(wy // TILE_SIZE)
-            if 0 <= dot_tx < MAP_W and 0 <= dot_ty < MAP_H:
+            if 0 <= dot_tx < mw and 0 <= dot_ty < mh:
                 mm_surf.set_at((dot_tx, dot_ty), (255, 60, 60))
-                # Make dot slightly larger (set neighbours too)
                 for ndx, ndy in [(-1,0),(1,0),(0,-1),(0,1)]:
                     nx2, ny2 = dot_tx + ndx, dot_ty + ndy
-                    if 0 <= nx2 < MAP_W and 0 <= ny2 < MAP_H:
+                    if 0 <= nx2 < mw and 0 <= ny2 < mh:
                         mm_surf.set_at((nx2, ny2), (220, 40, 40))
+
+        # Neutral camp markers
+        for camp in game.neutral_camps:
+            cx, cy, captured = camp[0], camp[1], camp[2]
+            if game.game_map.is_explored(cx, cy):
+                cc = TEAM_COLORS.get(captured, (160, 160, 100)) if captured is not None else (160, 160, 100)
+                for ndx in range(-1, 2):
+                    for ndy in range(-1, 2):
+                        nx2, ny2 = cx + ndx, cy + ndy
+                        if 0 <= nx2 < mw and 0 <= ny2 < mh:
+                            mm_surf.set_at((nx2, ny2), cc)
 
         # Scale to mm_rect
         scaled = pygame.transform.scale(mm_surf, (mm_rect.width, mm_rect.height))
@@ -456,10 +596,10 @@ class Renderer:
 
         # Viewport box (zoom-aware: more tiles visible when zoomed out)
         z = max(0.1, game.zoom)
-        vx = int((game.cam_x / TILE_SIZE) / MAP_W * mm_rect.width)
-        vy = int((game.cam_y / TILE_SIZE) / MAP_H * mm_rect.height)
-        vw = int((VIEWPORT_W / z / TILE_SIZE) / MAP_W * mm_rect.width)
-        vh = int((VIEWPORT_H / z / TILE_SIZE) / MAP_H * mm_rect.height)
+        vx = int((game.cam_x / TILE_SIZE) / mw * mm_rect.width)
+        vy = int((game.cam_y / TILE_SIZE) / mh * mm_rect.height)
+        vw = int((VIEWPORT_W / z / TILE_SIZE) / mw * mm_rect.width)
+        vh = int((VIEWPORT_H / z / TILE_SIZE) / mh * mm_rect.height)
         pygame.draw.rect(screen, (255, 255, 255),
                          (mm_rect.x + vx, mm_rect.y + vy, vw, vh), 1)
 

@@ -84,6 +84,7 @@ def show_main_menu(screen, game_surf) -> str | None:
     btn_x = SCREEN_W // 2 - btn_w // 2
     choices = [
         ('singleplayer', 'Singleplayer'),
+        ('load',         'Load Game'),
         ('host',         'Host Game'),
         ('join',         'Join Game'),
         (None,           'Quit'),
@@ -143,63 +144,102 @@ def show_main_menu(screen, game_surf) -> str | None:
 
 
 # ---------------------------------------------------------------------------
-# Host lobby
+# Game configuration screen
 # ---------------------------------------------------------------------------
 
-def show_host_lobby(screen, game_surf, session) -> str | None:
+def show_game_config(screen, game_surf) -> dict | None:
     """
-    Show the host waiting lobby. Returns client name on success, None on cancel.
+    Show game configuration screen.
+    Returns dict with config options, or None on cancel.
     """
-    import network
     font_title = _make_font(32, bold=True)
-    font_body  = _make_font(18)
+    font_label = _make_font(18, bold=True)
+    font_btn   = _make_font(18, bold=True)
     font_small = _make_font(15)
 
-    btn_start = pygame.Rect(SCREEN_W // 2 - 130, SCREEN_H // 2 + 80, 260, 50)
-    font_btn  = _make_font(20, bold=True)
+    # Config state
+    config = {
+        'num_players': 2,
+        'map_size': 'medium',
+        'game_mode': 'standard',
+        'ai_difficulty': 'normal',
+    }
 
-    local_ip = network.get_local_ip()
+    map_sizes = ['small', 'medium', 'large']
+    map_size_labels = {'small': 'Small (80x60)', 'medium': 'Medium (120x90)', 'large': 'Large (160x120)'}
+    game_modes = ['standard', 'king_of_hill', 'survival']
+    mode_labels = {'standard': 'Standard', 'king_of_hill': 'King of the Hill', 'survival': 'Survival'}
+    mode_descs = {
+        'standard': 'Destroy all enemy Town Halls to win.',
+        'king_of_hill': 'Hold the center hill for 3 minutes to win.',
+        'survival': 'Survive endless escalating waves of enemies.',
+    }
+    difficulties = ['easy', 'normal', 'hard']
+    diff_labels = {'easy': 'Easy', 'normal': 'Normal', 'hard': 'Hard'}
+
     clock = pygame.time.Clock()
+    start_rect = pygame.Rect(SCREEN_W // 2 - 130, SCREEN_H - 100, 260, 50)
+
+    # Clickable rects stored each frame: [(rect, key, value), ...]
+    click_rects = []
 
     while True:
         clock.tick(30)
         mx, my = display_mod.get_mouse_pos()
+        click_rects = []
 
-        # Poll for new client connection each frame
-        session.try_accept()
-
-        connected = session.is_connected()
-        client_nm = session.client_name
-
-        # Draw
         game_surf.fill((18, 20, 28))
 
-        cy = SCREEN_H // 4
-        _draw_centered_text(game_surf, font_title, "HOST GAME",
+        cy = 40
+        _draw_centered_text(game_surf, font_title, "GAME SETUP",
                             (120, 200, 110), cy)
-        cy += 60
+        cy += 70
 
-        _draw_centered_text(game_surf, font_body, f"Your IP: {local_ip}",
-                            (200, 210, 230), cy)
-        cy += 36
+        def _option_row(label_text, options, labels_dict, config_key, btn_w, cy_ref):
+            label = font_label.render(label_text, True, WHITE)
+            game_surf.blit(label, (SCREEN_W // 2 - 200, cy_ref))
+            gap = btn_w + 10
+            for i, opt in enumerate(options):
+                bx = SCREEN_W // 2 - 20 + i * gap
+                rect = pygame.Rect(bx, cy_ref - 4, btn_w, 32)
+                active = config[config_key] == opt
+                hovered = rect.collidepoint(mx, my)
+                bg = (80, 140, 80) if active else ((60, 65, 85) if hovered else (42, 45, 58))
+                pygame.draw.rect(game_surf, bg, rect, border_radius=4)
+                pygame.draw.rect(game_surf, (90, 100, 130), rect, 1, border_radius=4)
+                text = labels_dict[opt] if isinstance(labels_dict, dict) else str(opt)
+                ts = font_small.render(text, True, WHITE if active else (180, 180, 200))
+                game_surf.blit(ts, (rect.centerx - ts.get_width() // 2,
+                                    rect.centery - ts.get_height() // 2))
+                click_rects.append((rect, config_key, opt))
 
-        if connected:
-            _draw_centered_text(game_surf, font_body,
-                                f"Player 2: {client_nm} - Ready!",
-                                (80, 230, 80), cy)
-        else:
-            _draw_centered_text(game_surf, font_body,
-                                "Waiting for player to connect...",
-                                (160, 160, 180), cy)
-        cy += 50
+        # Players
+        player_labels = {n: str(n) for n in range(2, 7)}
+        _option_row("Players:", list(range(2, 7)), player_labels, 'num_players', 44, cy)
+        cy += 55
 
-        # Start button (only when client is ready)
-        hovered_start = btn_start.collidepoint(mx, my) and connected
-        _draw_button(game_surf, font_btn, "Press ENTER to start",
-                     btn_start, hovered_start, active=connected)
+        # Map Size
+        _option_row("Map Size:", map_sizes, map_size_labels, 'map_size', 130, cy)
+        cy += 55
 
-        _draw_centered_text(game_surf, font_small, "ESC to cancel",
-                            (120, 120, 130), SCREEN_H - 60)
+        # Game Mode
+        _option_row("Game Mode:", game_modes, mode_labels, 'game_mode', 135, cy)
+        cy += 40
+        desc = mode_descs.get(config['game_mode'], '')
+        desc_s = font_small.render(desc, True, (160, 160, 180))
+        game_surf.blit(desc_s, (SCREEN_W // 2 - desc_s.get_width() // 2, cy))
+        cy += 40
+
+        # AI Difficulty
+        _option_row("AI Difficulty:", difficulties, diff_labels, 'ai_difficulty', 90, cy)
+        cy += 70
+
+        # Start button
+        hovered_start = start_rect.collidepoint(mx, my)
+        _draw_button(game_surf, font_btn, "START GAME", start_rect, hovered_start)
+
+        _draw_centered_text(game_surf, font_small, "ESC to go back",
+                            (120, 120, 130), SCREEN_H - 40)
 
         _scale_to_screen(screen, game_surf)
 
@@ -212,12 +252,245 @@ def show_host_lobby(screen, game_surf, session) -> str | None:
             elif event.type == KEYDOWN:
                 if event.key == K_ESCAPE:
                     return None
-                elif event.key == K_RETURN and connected:
-                    return client_nm
+                elif event.key == K_RETURN:
+                    return config
             elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                 gpos = display_mod.game_pos(event.pos)
-                if btn_start.collidepoint(gpos) and connected:
-                    return client_nm
+                for rect, key, val in click_rects:
+                    if rect.collidepoint(gpos):
+                        config[key] = val
+                if start_rect.collidepoint(gpos):
+                    return config
+
+
+# ---------------------------------------------------------------------------
+# Load game screen
+# ---------------------------------------------------------------------------
+
+def show_load_screen(screen, game_surf) -> str | None:
+    """Show save file browser. Returns filename to load, or None on cancel."""
+    from savegame import list_saves
+    import time as _time
+
+    font_title = _make_font(32, bold=True)
+    font_btn   = _make_font(18, bold=True)
+    font_small = _make_font(15)
+
+    clock = pygame.time.Clock()
+
+    while True:
+        clock.tick(30)
+        saves = list_saves()
+        mx, my = display_mod.get_mouse_pos()
+
+        game_surf.fill((18, 20, 28))
+        cy = 40
+        _draw_centered_text(game_surf, font_title, "LOAD GAME",
+                            (120, 200, 110), cy)
+        cy += 70
+
+        if not saves:
+            _draw_centered_text(game_surf, font_small, "No save files found.",
+                                (160, 160, 180), cy)
+        else:
+            row_rects = []
+            for i, (filename, name, ts) in enumerate(saves[:8]):
+                # Format timestamp
+                if ts > 0:
+                    lt = _time.localtime(ts)
+                    date_str = _time.strftime('%Y-%m-%d %H:%M', lt)
+                else:
+                    date_str = '???'
+                label = f"{name}   ({date_str})"
+                rect = pygame.Rect(SCREEN_W // 2 - 220, cy, 440, 36)
+                hovered = rect.collidepoint(mx, my)
+                _draw_button(game_surf, font_small, label, rect, hovered)
+                row_rects.append((rect, filename))
+                cy += 44
+
+        _draw_centered_text(game_surf, font_small, "ESC to go back",
+                            (120, 120, 130), SCREEN_H - 40)
+
+        _scale_to_screen(screen, game_surf)
+
+        for event in pygame.event.get():
+            if event.type == QUIT:
+                return None
+            elif event.type == pygame.VIDEORESIZE:
+                sr = display_mod.calc_scale_rect(event.w, event.h)
+                display_mod.set_scale_rect(sr)
+            elif event.type == KEYDOWN:
+                if event.key == K_ESCAPE:
+                    return None
+            elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                gpos = display_mod.game_pos(event.pos)
+                if saves:
+                    for rect, filename in row_rects:
+                        if rect.collidepoint(gpos):
+                            return filename
+
+
+# ---------------------------------------------------------------------------
+# Host lobby
+# ---------------------------------------------------------------------------
+
+def show_host_lobby(screen, game_surf, session) -> dict | None:
+    """
+    Show the host waiting lobby with game config and player list.
+    Returns config dict on start, or None on cancel.
+    """
+    import network
+    font_title = _make_font(32, bold=True)
+    font_label = _make_font(18, bold=True)
+    font_body  = _make_font(18)
+    font_small = _make_font(15)
+    font_btn   = _make_font(20, bold=True)
+
+    local_ip = network.get_local_ip()
+    clock = pygame.time.Clock()
+
+    # Game config (host chooses settings)
+    config = {
+        'map_size': 'medium',
+        'game_mode': 'standard',
+        'ai_difficulty': 'normal',
+    }
+
+    map_sizes = ['small', 'medium', 'large']
+    map_size_labels = {'small': 'Small', 'medium': 'Medium', 'large': 'Large'}
+    game_modes = ['standard', 'king_of_hill', 'survival']
+    mode_labels = {'standard': 'Standard', 'king_of_hill': 'King of the Hill',
+                   'survival': 'Survival'}
+    difficulties = ['easy', 'normal', 'hard']
+    diff_labels = {'easy': 'Easy', 'normal': 'Normal', 'hard': 'Hard'}
+
+    # Team colors for display
+    team_colors = [
+        (80, 180, 80),    # 0 = host (green)
+        (80, 130, 230),   # 1 = blue
+        (230, 80, 80),    # 2 = red
+        (230, 200, 50),   # 3 = yellow
+        (180, 80, 220),   # 4 = purple
+        (230, 140, 50),   # 5 = orange
+    ]
+
+    btn_start = pygame.Rect(SCREEN_W // 2 - 130, SCREEN_H - 90, 260, 50)
+    click_rects = []
+
+    while True:
+        clock.tick(30)
+        mx, my = display_mod.get_mouse_pos()
+        click_rects = []
+
+        # Poll for new client connections
+        session.try_accept()
+
+        clients = session.clients_info
+        has_clients = len(clients) > 0
+
+        # Draw
+        game_surf.fill((18, 20, 28))
+
+        cy = 30
+        _draw_centered_text(game_surf, font_title, "HOST GAME",
+                            (120, 200, 110), cy)
+        cy += 50
+
+        _draw_centered_text(game_surf, font_body, f"Your IP: {local_ip}",
+                            (200, 210, 230), cy)
+        cy += 40
+
+        # --- Player list ---
+        _draw_centered_text(game_surf, font_label, "Players:",
+                            WHITE, cy)
+        cy += 28
+
+        # Host (always player 1, team 0)
+        host_txt = font_small.render("  1. You (Host)", True, team_colors[0])
+        game_surf.blit(host_txt, (SCREEN_W // 2 - 120, cy))
+        cy += 24
+
+        if clients:
+            for ci in clients:
+                idx = ci['team'] + 1
+                col = team_colors[ci['team']] if ci['team'] < len(team_colors) else WHITE
+                status = "Ready" if ci['connected'] else "Disconnected"
+                txt = font_small.render(f"  {idx}. {ci['name']} - {status}",
+                                        True, col if ci['connected'] else (120, 120, 130))
+                game_surf.blit(txt, (SCREEN_W // 2 - 120, cy))
+                cy += 24
+        else:
+            txt = font_small.render("  Waiting for players...", True, (120, 120, 140))
+            game_surf.blit(txt, (SCREEN_W // 2 - 120, cy))
+            cy += 24
+
+        # Show slots remaining
+        max_c = session._max_clients
+        slots = max_c - len(clients)
+        if slots > 0:
+            txt = font_small.render(f"  ({slots} slot{'s' if slots != 1 else ''} open)",
+                                    True, (100, 100, 120))
+            game_surf.blit(txt, (SCREEN_W // 2 - 120, cy))
+        cy += 36
+
+        # --- Config options ---
+        def _option_row(label_text, options, labels_dict, config_key, btn_w, cy_ref):
+            label = font_label.render(label_text, True, WHITE)
+            game_surf.blit(label, (SCREEN_W // 2 - 200, cy_ref))
+            gap = btn_w + 10
+            for i, opt in enumerate(options):
+                bx = SCREEN_W // 2 - 20 + i * gap
+                rect = pygame.Rect(bx, cy_ref - 4, btn_w, 32)
+                active = config[config_key] == opt
+                hovered = rect.collidepoint(mx, my)
+                bg = (80, 140, 80) if active else ((60, 65, 85) if hovered else (42, 45, 58))
+                pygame.draw.rect(game_surf, bg, rect, border_radius=4)
+                pygame.draw.rect(game_surf, (90, 100, 130), rect, 1, border_radius=4)
+                text = labels_dict[opt] if isinstance(labels_dict, dict) else str(opt)
+                ts = font_small.render(text, True, WHITE if active else (180, 180, 200))
+                game_surf.blit(ts, (rect.centerx - ts.get_width() // 2,
+                                    rect.centery - ts.get_height() // 2))
+                click_rects.append((rect, config_key, opt))
+
+        _option_row("Map Size:", map_sizes, map_size_labels, 'map_size', 100, cy)
+        cy += 45
+        _option_row("Game Mode:", game_modes, mode_labels, 'game_mode', 135, cy)
+        cy += 45
+        _option_row("AI Difficulty:", difficulties, diff_labels, 'ai_difficulty', 90, cy)
+        cy += 50
+
+        # Start button (enabled when at least one client connected)
+        hovered_start = btn_start.collidepoint(mx, my) and has_clients
+        _draw_button(game_surf, font_btn, "START GAME (Enter)",
+                     btn_start, hovered_start, active=has_clients)
+
+        _draw_centered_text(game_surf, font_small, "ESC to cancel",
+                            (120, 120, 130), SCREEN_H - 35)
+
+        _scale_to_screen(screen, game_surf)
+
+        for event in pygame.event.get():
+            if event.type == QUIT:
+                return None
+            elif event.type == pygame.VIDEORESIZE:
+                sr = display_mod.calc_scale_rect(event.w, event.h)
+                display_mod.set_scale_rect(sr)
+            elif event.type == KEYDOWN:
+                if event.key == K_ESCAPE:
+                    return None
+                elif event.key == K_RETURN and has_clients:
+                    config['num_players'] = 1 + len(clients)  # host + clients
+                    config['human_teams'] = [0] + [c['team'] for c in clients]
+                    return config
+            elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                gpos = display_mod.game_pos(event.pos)
+                for rect, key, val in click_rects:
+                    if rect.collidepoint(gpos):
+                        config[key] = val
+                if btn_start.collidepoint(gpos) and has_clients:
+                    config['num_players'] = 1 + len(clients)
+                    config['human_teams'] = [0] + [c['team'] for c in clients]
+                    return config
 
 
 # ---------------------------------------------------------------------------
@@ -266,13 +539,16 @@ def show_join_screen(screen, game_surf) -> tuple | None:
         if hosts:
             _draw_centered_text(game_surf, font_small, "Found games:", (180, 180, 200), cy)
             cy += 24
-            for i, (addr, seed, hname) in enumerate(hosts):
+            for i, host_info in enumerate(hosts):
+                addr, seed, hname = host_info[0], host_info[1], host_info[2]
+                n_players = host_info[3] if len(host_info) > 3 else 1
+                max_players = host_info[4] if len(host_info) > 4 else 6
                 row_rect = pygame.Rect(SCREEN_W // 2 - 220, cy, 340, 34)
                 join_rect= pygame.Rect(SCREEN_W // 2 + 130, cy, 90, 34)
                 hovered_row  = row_rect.collidepoint(mx, my)
                 hovered_join = join_rect.collidepoint(mx, my)
-                _draw_button(game_surf, font_small, f"{hname}  [{addr}]",
-                             row_rect, hovered_row)
+                label = f"{hname}  [{addr}]  ({n_players}/{max_players})"
+                _draw_button(game_surf, font_small, label, row_rect, hovered_row)
                 _draw_button(game_surf, font_btn, "JOIN", join_rect, hovered_join)
                 cy += 44
         else:
@@ -331,7 +607,8 @@ def show_join_screen(screen, game_surf) -> tuple | None:
                 cy2 = SCREEN_H // 4 + 56
                 if hosts:
                     cy2 += 24
-                    for addr, seed, hname in hosts:
+                    for host_info in hosts:
+                        addr, seed, hname = host_info[0], host_info[1], host_info[2]
                         row_rect2 = pygame.Rect(SCREEN_W // 2 - 220, cy2, 340, 34)
                         join_rect2= pygame.Rect(SCREEN_W // 2 + 130, cy2, 90, 34)
                         if row_rect2.collidepoint(gpos) or join_rect2.collidepoint(gpos):
@@ -468,11 +745,24 @@ def run_game_loop(screen, game_surf, clock, game, assets,
             else:
                 game.handle_event(event, ui)
 
+        # --- Quick-load (F9) ---
+        if getattr(game, '_request_load', False) and session is None:
+            game._request_load = False
+            from savegame import list_saves, load_game
+            saves = list_saves()
+            if saves:
+                try:
+                    game = load_game(saves[0][0])
+                    renderer = Renderer(game_surf, assets)
+                    ui = UI(assets)
+                except Exception as e:
+                    print(f"Quick-load failed: {e}")
+
         # --- Simulation ---
         if not game.game_over:
             game.update_camera(dt)
             # Only the host (or singleplayer) runs the simulation
-            if session is None or is_host:
+            if not getattr(game, 'paused', False) and (session is None or is_host):
                 game.update(dt)
         else:
             # Still allow camera panning during end screen
@@ -500,14 +790,26 @@ def run_game_loop(screen, game_surf, clock, game, assets,
             game_surf.blit(ms, (SCREEN_W // 2 - ms.get_width() // 2,
                                 VIEWPORT_Y + VIEWPORT_H - 30 - i * 20))
 
-        # Multiplayer end-game overlay (client perspective)
+        # Pause overlay
+        if getattr(game, 'paused', False):
+            dim = pygame.Surface((SCREEN_W, SCREEN_H), pygame.SRCALPHA)
+            dim.fill((0, 0, 0, 120))
+            game_surf.blit(dim, (0, 0))
+            pause_txt = font_end.render("PAUSED", True, (220, 220, 230))
+            game_surf.blit(pause_txt, (SCREEN_W // 2 - pause_txt.get_width() // 2,
+                                       SCREEN_H // 2 - pause_txt.get_height() // 2))
+            hint = font_msg.render("Press ESC to resume", True, (160, 160, 180))
+            game_surf.blit(hint, (SCREEN_W // 2 - hint.get_width() // 2,
+                                  SCREEN_H // 2 + pause_txt.get_height() // 2 + 10))
+
+        # Multiplayer end-game overlay
         if game.game_over and session is not None:
-            # Host: player_won=True means team 0 wins
-            # Client is team 1, so if player_won=True they lose
-            if is_host:
-                won = game.player_won
-            else:
-                won = not game.player_won   # team 1 wins when team 0 loses
+            my_team = game.net_my_team
+            my_player = game.players.get(my_team)
+            # Player wins if their town hall still stands
+            won = my_player is not None and any(
+                b.btype == 'town_hall' and b.alive
+                for b in my_player.buildings)
             label = "VICTORY!" if won else "DEFEAT"
             col   = (80, 240, 80) if won else (240, 60, 60)
             big   = font_end.render(label, True, col)
@@ -547,24 +849,46 @@ def main():
             break
 
         elif choice == 'singleplayer':
-            game = Game()
+            cfg = show_game_config(screen, game_surf)
+            if cfg is None:
+                continue
+            game = Game(config=cfg)
             run_game_loop(screen, game_surf, clock, game, assets)
+
+        elif choice == 'load':
+            filename = show_load_screen(screen, game_surf)
+            if filename:
+                from savegame import load_game
+                try:
+                    game = load_game(filename)
+                    run_game_loop(screen, game_surf, clock, game, assets)
+                except Exception as e:
+                    print(f"Load failed: {e}")
+                    import traceback; traceback.print_exc()
 
         elif choice == 'host':
             import network
             seed = random.randint(0, 99999)
             session = network.HostSession(seed, network.get_local_ip())
-            client_name = show_host_lobby(screen, game_surf, session)
-            if client_name:
-                session.send_start(client_team=1)
-                game = Game(seed=seed)
+            lobby_result = show_host_lobby(screen, game_surf, session)
+            if lobby_result:
+                cfg = lobby_result
+                human_teams = set(cfg.pop('human_teams', [0]))
+                session.send_start(config=cfg | {'seed': seed})
+                cfg['seed'] = seed
+                game = Game(seed=seed, config=cfg)
                 game.net_mode     = 'host'
                 game.net_my_team  = 0
                 game._net_session = session
-                # Team 1 is human-controlled — cancel the AI's auto-assigned gather
-                from constants import AI_TEAM
-                for u in game.players[AI_TEAM].units:
-                    u.stop()
+                # Stop AI for all human-controlled teams and cancel auto-gather
+                game.ai_controllers = [
+                    ai for ai in game.ai_controllers
+                    if ai.team not in human_teams
+                ]
+                for ht in human_teams:
+                    if ht != 0 and ht in game.players:
+                        for u in game.players[ht].units:
+                            u.stop()
                 run_game_loop(screen, game_surf, clock, game, assets,
                               session=session, is_host=True)
             session.close()
@@ -582,7 +906,9 @@ def main():
                     if start_info:
                         seed        = start_info['seed']
                         client_team = start_info['client_team']
-                        game = Game(seed=seed)
+                        cfg         = start_info.get('config', {})
+                        cfg['seed'] = seed
+                        game = Game(seed=seed, config=cfg)
                         game.net_mode     = 'client'
                         game.net_my_team  = client_team
                         game._net_session = session

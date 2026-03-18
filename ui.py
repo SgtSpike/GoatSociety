@@ -54,6 +54,7 @@ class UIAction:
     ATTACK_MOVE   = 'attack_move'
     CANCEL_QUEUE  = 'cancel_queue'
     RALLY         = 'rally'
+    PATROL        = 'patrol'
 
     def __init__(self, kind, **kwargs):
         self.kind = kind
@@ -155,6 +156,30 @@ class UI:
         ts = self.font_lg.render(time_str, True, (180, 180, 190))
         screen.blit(ts, (SCREEN_W // 2 - ts.get_width() // 2, cy - ts.get_height() // 2))
 
+        # Game mode indicator (right of time)
+        if game.game_mode == 'king_of_hill':
+            best_t = max(game._koth_control.values()) if game._koth_control else 0
+            pct = int(100 * best_t / game._koth_time_to_win)
+            mode_txt = f"KOTH: {pct}%"
+            mode_col = (220, 180, 50)
+            ms = self.font_md.render(mode_txt, True, mode_col)
+            screen.blit(ms, (SCREEN_W // 2 + ts.get_width() // 2 + 16,
+                             cy - ms.get_height() // 2))
+        elif game.game_mode == 'survival':
+            # Compute time remaining until next wave
+            interval = max(30.0, game._survival_interval - game._survival_wave * 10)
+            remaining = max(0.0, interval - game._survival_timer)
+            r_min = int(remaining) // 60
+            r_sec = int(remaining) % 60
+            if game._survival_wave == 0:
+                mode_txt = f"Next wave: {r_min}:{r_sec:02d}"
+            else:
+                mode_txt = f"Wave {game._survival_wave}  |  Next: {r_min}:{r_sec:02d}"
+            mode_col = (220, 80, 80) if remaining < 30 else (220, 180, 50)
+            ms = self.font_md.render(mode_txt, True, mode_col)
+            screen.blit(ms, (SCREEN_W // 2 + ts.get_width() // 2 + 16,
+                             cy - ms.get_height() // 2))
+
         # Idle worker button (right side of time, before minimap area)
         idle_workers = game.idle_workers(game._my_team)
         n_idle = len(idle_workers)
@@ -208,6 +233,28 @@ class UI:
 
         if len(sel) == 1:
             ent = sel[0]
+
+            # Portrait in top-right of info panel
+            portrait_size = 56
+            portrait_x = self.info_rect.right - portrait_size - 8
+            portrait_y = self.info_rect.y + 8
+            pygame.draw.rect(screen, (38, 38, 48),
+                             (portrait_x - 2, portrait_y - 2,
+                              portrait_size + 4, portrait_size + 4),
+                             border_radius=4)
+            pygame.draw.rect(screen, TEAM_COLORS.get(ent.team, (100, 100, 100)),
+                             (portrait_x - 2, portrait_y - 2,
+                              portrait_size + 4, portrait_size + 4), 2,
+                             border_radius=4)
+            if isinstance(ent, Unit):
+                port_surf = self.assets.get_unit(ent.utype, ent.team)
+            else:
+                port_surf = self.assets.get_building(ent.btype, ent.team)
+            if port_surf:
+                scaled = pygame.transform.smoothscale(
+                    port_surf, (portrait_size, portrait_size))
+                screen.blit(scaled, (portrait_x, portrait_y))
+
             # Name
             name = getattr(ent, 'utype', None) or getattr(ent, 'btype', '?')
             name_surf = self.font_lg.render(name.replace('_', ' ').title(), True, WHITE)
@@ -285,16 +332,27 @@ class UI:
                         screen.blit(qs, (px, py)); py += 14
 
         else:
-            # Multi-select summary
+            # Multi-select summary with mini portraits
             from collections import Counter
             types = Counter()
+            first_team = sel[0].team if sel else 0
             for e in sel:
                 k = getattr(e, 'utype', None) or getattr(e, 'btype', '?')
                 types[k] += 1
             y = py
             for k, cnt in types.items():
+                # Mini portrait
+                icon_size = 20
+                icon_surf = self.assets.get_unit(k, first_team)
+                if icon_surf is None:
+                    icon_surf = self.assets.get_building(k, first_team)
+                if icon_surf:
+                    scaled = pygame.transform.smoothscale(
+                        icon_surf, (icon_size, icon_size))
+                    screen.blit(scaled, (px, y))
                 s = self.font_md.render(f"{cnt}x {k.replace('_',' ').title()}", True, WHITE)
-                screen.blit(s, (px, y)); y += s.get_height() + 2
+                screen.blit(s, (px + icon_size + 4, y + 2))
+                y += max(s.get_height(), icon_size) + 2
 
     # ----------------------------------------------------------- button panel
     def _draw_button_panel(self, screen, game):
@@ -407,6 +465,9 @@ class UI:
                 buttons.append(('cmd_attack_move', UIAction(UIAction.ATTACK_MOVE),
                                 [('Attack Move (A)', C_HEAD, True),
                                  ('Move while auto-attacking enemies in range.', C_DESC, False)]))
+            buttons.append(('cmd_patrol', UIAction(UIAction.PATROL),
+                            [('Patrol (P)', C_HEAD, True),
+                             ('Walk between two points, attacking enemies in sight.', C_DESC, False)]))
 
         # -- Single building
         if len(sel) == 1 and isinstance(sel[0], Building):
@@ -503,11 +564,10 @@ class UI:
 
         # Minimap click → scroll camera
         if self.minimap_inner.collidepoint(pos):
-            from constants import MAP_W, MAP_H, TILE_SIZE
             rx = (pos[0] - self.minimap_inner.x) / self.minimap_inner.width
             ry = (pos[1] - self.minimap_inner.y) / self.minimap_inner.height
-            game.cam_x = rx * MAP_W * TILE_SIZE - VIEWPORT_W / 2
-            game.cam_y = ry * MAP_H * TILE_SIZE - VIEWPORT_H / 2
+            game.cam_x = rx * game.game_map.width * TILE_SIZE - VIEWPORT_W / 2
+            game.cam_y = ry * game.game_map.height * TILE_SIZE - VIEWPORT_H / 2
             game._clamp_camera()
             return None
 

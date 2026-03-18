@@ -90,7 +90,7 @@ def get_local_ip() -> str:
 def discover_hosts(timeout: float = 2.0) -> list:
     """
     Listen on UDP_PORT for GOAT beacon packets for `timeout` seconds.
-    Returns list of (addr_str, seed_int, host_name_str).
+    Returns list of (addr_str, seed_int, host_name_str, players_int, max_players_int).
     """
     results = []
     seen_addrs = set()
@@ -121,7 +121,14 @@ def discover_hosts(timeout: float = 2.0) -> list:
                         except ValueError:
                             seed = 0
                         name = parts[2]
-                        results.append((ip, seed, name))
+                        # Parse player count if available
+                        try:
+                            n_clients = int(parts[3]) if len(parts) > 3 else 0
+                            max_clients = int(parts[4]) if len(parts) > 4 else 5
+                        except ValueError:
+                            n_clients, max_clients = 0, 5
+                        # +1 for host in both counts
+                        results.append((ip, seed, name, n_clients + 1, max_clients + 1))
         except socket.timeout:
             pass
         except OSError:
@@ -139,28 +146,28 @@ class HostSession:
     """
     Manages the server side of a multiplayer session.
     - Broadcasts UDP beacon while in lobby.
-    - Listens on TCP for a single client.
-    - After connection, recv loop runs in a daemon thread.
-    - Commands from client are queued; caller polls with poll_commands().
-    - State snapshots sent to client with send_state().
+    - Listens on TCP for up to (max_players - 1) clients.
+    - After connection, recv loop runs in a daemon thread per client.
+    - Commands from all clients are queued; caller polls with poll_commands().
+    - State snapshots broadcast to all connected clients with send_state().
     """
 
-    def __init__(self, seed: int, host_name: str):
+    def __init__(self, seed: int, host_name: str, max_clients: int = 5):
         self._seed = seed
         self._host_name = host_name
+        self._max_clients = max_clients
 
-        self._client_name: str = ''
-        self._client_ready: bool = False
-        self._connected: bool = False
+        # Each client entry: {sock, name, team, connected, thread}
+        self._clients: list[dict] = []
+        self._clients_lock = threading.Lock()
 
         self._cmd_queue: queue.Queue = queue.Queue()
-        self._client_sock: socket.socket | None = None
 
         # TCP server socket
         self._server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self._server_sock.bind(('', TCP_PORT))
-        self._server_sock.listen(1)
+        self._server_sock.listen(5)
         self._server_sock.setblocking(False)
 
         # Start UDP beacon thread
@@ -172,8 +179,9 @@ class HostSession:
     def _beacon_loop(self):
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        msg = f'GOAT|{self._seed}|{self._host_name}'.encode('utf-8')
         while self._beacon_running:
+            n = len(self._clients)
+            msg = f'GOAT|{self._seed}|{self._host_name}|{n}|{self._max_clients}'.encode('utf-8')
             try:
                 sock.sendto(msg, ('<broadcast>', UDP_PORT))
             except OSError:
@@ -190,31 +198,39 @@ class HostSession:
     # ----------------------------------------------------------------- accept
     def try_accept(self) -> bool:
         """
-        Non-blocking: check if a client has connected.
-        If so, read their READY message, store name, return True.
+        Non-blocking: check if a new client has connected.
+        Accepts multiple clients up to max_clients.
+        Returns True if a new client was accepted this call.
         Call once per frame from lobby loop.
         """
-        if self._connected:
-            return True
+        if len(self._clients) >= self._max_clients:
+            return False
         try:
             conn, _addr = self._server_sock.accept()
             conn.setblocking(True)
-            self._client_sock = conn
             # Read READY message (blocking, but fast in practice)
             conn.settimeout(5.0)
             msg = recv_msg(conn)
             conn.settimeout(None)
             if msg and msg.get('t') == 'ready':
-                self._client_name = msg.get('name', 'Player 2')
-                self._client_ready = True
-                self._connected = True
-                # Start recv thread
-                t = threading.Thread(target=self._recv_loop, daemon=True)
+                # Assign next available team (host is team 0, clients get 1, 2, 3...)
+                team = len(self._clients) + 1
+                client = {
+                    'sock': conn,
+                    'name': msg.get('name', f'Player {team + 1}'),
+                    'team': team,
+                    'connected': True,
+                }
+                # Start recv thread for this client
+                t = threading.Thread(target=self._recv_loop,
+                                     args=(client,), daemon=True)
+                client['thread'] = t
+                with self._clients_lock:
+                    self._clients.append(client)
                 t.start()
                 return True
             else:
                 conn.close()
-                self._client_sock = None
         except BlockingIOError:
             pass
         except OSError:
@@ -222,48 +238,77 @@ class HostSession:
         return False
 
     # ---------------------------------------------------------------- recv loop
-    def _recv_loop(self):
-        """Background thread: read commands from client and enqueue them."""
-        sock = self._client_sock
-        while self._connected and sock:
+    def _recv_loop(self, client: dict):
+        """Background thread: read commands from one client and enqueue them."""
+        sock = client['sock']
+        while client['connected']:
             msg = recv_msg(sock)
             if msg is None:
-                self._connected = False
+                client['connected'] = False
                 break
             self._cmd_queue.put(msg)
 
     # ---------------------------------------------------------------- properties
     @property
-    def client_name(self) -> str:
-        return self._client_name
+    def client_names(self) -> list[str]:
+        """Return list of connected client names."""
+        with self._clients_lock:
+            return [c['name'] for c in self._clients if c['connected']]
 
-    def client_ready(self) -> bool:
-        return self._client_ready
+    @property
+    def num_clients(self) -> int:
+        with self._clients_lock:
+            return sum(1 for c in self._clients if c['connected'])
+
+    @property
+    def clients_info(self) -> list[dict]:
+        """Return list of {name, team, connected} for each client."""
+        with self._clients_lock:
+            return [{'name': c['name'], 'team': c['team'],
+                     'connected': c['connected']} for c in self._clients]
+
+    # Backwards compat: single-client property
+    @property
+    def client_name(self) -> str:
+        names = self.client_names
+        return names[0] if names else ''
 
     def is_connected(self) -> bool:
-        return self._connected
+        """True if at least one client is still connected."""
+        with self._clients_lock:
+            return any(c['connected'] for c in self._clients)
 
     # ----------------------------------------------------------------- send
-    def send_start(self, client_team: int = 1):
-        """Send the START packet and stop the UDP beacon."""
+    def send_start(self, config=None):
+        """Send the START packet to all clients and stop the UDP beacon."""
         self._stop_beacon()
-        if self._client_sock:
-            send_msg(self._client_sock, {
-                't': 'start',
-                'seed': self._seed,
-                'client_team': client_team,
-            })
+        with self._clients_lock:
+            for c in self._clients:
+                if c['connected']:
+                    send_msg(c['sock'], {
+                        't': 'start',
+                        'seed': self._seed,
+                        'client_team': c['team'],
+                        'config': config or {},
+                    })
 
     def send_state(self, state_dict: dict):
-        """Send a state snapshot to the client."""
-        if self._connected and self._client_sock:
-            ok = send_msg(self._client_sock, state_dict)
-            if not ok:
-                self._connected = False
+        """Broadcast a state snapshot to all connected clients."""
+        # Pre-encode once, send to all
+        raw = json.dumps(state_dict).encode('utf-8')
+        header = struct.pack('>I', len(raw))
+        frame = header + raw
+        with self._clients_lock:
+            for c in self._clients:
+                if c['connected']:
+                    try:
+                        c['sock'].sendall(frame)
+                    except (OSError, BrokenPipeError, ConnectionResetError):
+                        c['connected'] = False
 
     # ----------------------------------------------------------------- poll
     def poll_commands(self) -> list:
-        """Return all pending command dicts received from the client."""
+        """Return all pending command dicts received from all clients."""
         cmds = []
         while True:
             try:
@@ -275,13 +320,14 @@ class HostSession:
     # ----------------------------------------------------------------- close
     def close(self):
         self._stop_beacon()
-        self._connected = False
-        if self._client_sock:
-            try:
-                self._client_sock.close()
-            except OSError:
-                pass
-            self._client_sock = None
+        with self._clients_lock:
+            for c in self._clients:
+                c['connected'] = False
+                try:
+                    c['sock'].close()
+                except OSError:
+                    pass
+            self._clients.clear()
         try:
             self._server_sock.close()
         except OSError:

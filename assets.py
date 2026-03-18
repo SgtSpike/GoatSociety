@@ -35,12 +35,22 @@ class Assets:
             pygame.draw.circle(s, c, (x, y), rng.randint(1, 2))
         self.tiles[TILE_GRASS] = s
 
-        # --- Water ---
-        s = pygame.Surface((ts, ts))
-        s.fill((42, 90, 155))
-        for i in range(0, ts, 6):
-            pygame.draw.line(s, (55, 108, 175), (0, i), (ts, (i + 3) % ts), 1)
-        self.tiles[TILE_WATER] = s
+        # --- Water (animated: 8 frames) ---
+        self._water_frames = []
+        for frame in range(8):
+            s = pygame.Surface((ts, ts))
+            s.fill((42, 90, 155))
+            offset = frame * 2
+            for i in range(0, ts + 6, 6):
+                y_start = (i + offset) % ts
+                pygame.draw.line(s, (55, 108, 175),
+                                 (0, y_start), (ts, (y_start + 3) % ts), 1)
+                # Secondary lighter wave
+                y2 = (i + offset + 3) % ts
+                pygame.draw.line(s, (65, 120, 190),
+                                 (4, y2), (ts - 4, (y2 + 2) % ts), 1)
+            self._water_frames.append(s)
+        self.tiles[TILE_WATER] = self._water_frames[0]
 
         # --- Forest ---
         s = pygame.Surface((ts, ts))
@@ -128,10 +138,17 @@ class Assets:
             'knight':  (155, 155, 180),
         }
         for utype, col in colors.items():
-            for team in [0, 1]:
+            for team in TEAM_COLORS:
                 s = pygame.Surface((ts, ts), pygame.SRCALPHA)
                 self._draw_goat(s, col, TEAM_COLORS[team], utype)
                 self.units[f'{utype}_{team}'] = s
+
+                # Dead goat sprite (flipped on side, grayed out)
+                dead = pygame.Surface((ts, ts), pygame.SRCALPHA)
+                gray = tuple(min(255, c // 2 + 40) for c in col)
+                self._draw_goat(dead, gray, tuple(c // 2 for c in TEAM_COLORS[team]), utype)
+                dead = pygame.transform.rotate(dead, 90)
+                self.units[f'{utype}_{team}_dead'] = dead
 
     # -------------------------------------------------------------- buildings
     def _draw_building(self, btype, w_tiles, h_tiles, team):
@@ -275,7 +292,7 @@ class Assets:
         btypes = list(BUILDING_SIZES.keys()) + ['wall_v']
         for btype in btypes:
             w, h = self._BUILDING_SIZE_OVERRIDES.get(btype, BUILDING_SIZES.get(btype, (2, 2)))
-            for team in [0, 1]:
+            for team in TEAM_COLORS:
                 self.buildings[f'{btype}_{team}'] = self._draw_building(btype, w, h, team)
 
             # Ghost (build preview) - valid
@@ -289,6 +306,56 @@ class Assets:
             red_overlay.fill((180, 0, 0, 80))
             ghost_bad.blit(red_overlay, (0, 0))
             self.buildings[f'{btype}_ghost_bad'] = ghost_bad
+
+            # Destroyed rubble sprite
+            pw2, ph2 = w * TILE_SIZE, h * TILE_SIZE
+            rubble = pygame.Surface((pw2, ph2), pygame.SRCALPHA)
+            rng_r = random.Random(hash(btype) + 42)
+            # Rubble pile
+            for _ in range(max(6, w * h * 3)):
+                rx = rng_r.randint(2, pw2 - 6)
+                ry = rng_r.randint(ph2 // 3, ph2 - 4)
+                rw = rng_r.randint(4, 10)
+                rh = rng_r.randint(3, 7)
+                rc = rng_r.choice([(90, 85, 75), (110, 100, 85), (75, 70, 65),
+                                   (120, 80, 40), (80, 75, 70)])
+                pygame.draw.rect(rubble, rc, (rx, ry, rw, rh))
+            # Smoke wisps
+            for _ in range(3):
+                sx2 = rng_r.randint(pw2 // 4, pw2 * 3 // 4)
+                sy2 = rng_r.randint(4, ph2 // 2)
+                pygame.draw.circle(rubble, (80, 80, 80, 100), (sx2, sy2),
+                                   rng_r.randint(4, 8))
+            self.buildings[f'{btype}_rubble'] = rubble
+
+            # Damage overlay: cracks (shown when HP < 50%)
+            pw3, ph3 = w * TILE_SIZE, h * TILE_SIZE
+            cracks = pygame.Surface((pw3, ph3), pygame.SRCALPHA)
+            rng_c = random.Random(hash(btype) + 99)
+            for _ in range(4):
+                cx2 = rng_c.randint(pw3 // 4, pw3 * 3 // 4)
+                cy2 = rng_c.randint(ph3 // 4, ph3 * 3 // 4)
+                pts = [(cx2, cy2)]
+                for _ in range(rng_c.randint(2, 4)):
+                    cx2 += rng_c.randint(-8, 8)
+                    cy2 += rng_c.randint(-6, 10)
+                    pts.append((cx2, cy2))
+                pygame.draw.lines(cracks, (30, 25, 20, 200), False, pts, 2)
+            self.buildings[f'{btype}_cracks'] = cracks
+
+            # Fire overlay (shown when HP < 25%)
+            fire = pygame.Surface((pw3, ph3), pygame.SRCALPHA)
+            for _ in range(3):
+                fx = rng_c.randint(pw3 // 4, pw3 * 3 // 4)
+                fy = rng_c.randint(ph3 // 4, ph3 * 3 // 4)
+                # Flame: yellow core, orange outer, red tips
+                pygame.draw.ellipse(fire, (200, 60, 20, 150),
+                                    (fx - 6, fy - 4, 12, 16))
+                pygame.draw.ellipse(fire, (240, 160, 20, 180),
+                                    (fx - 4, fy, 8, 10))
+                pygame.draw.ellipse(fire, (255, 240, 80, 200),
+                                    (fx - 2, fy + 3, 4, 5))
+            self.buildings[f'{btype}_fire'] = fire
 
             # Construction site
             pw, ph = w * TILE_SIZE, h * TILE_SIZE
@@ -358,6 +425,7 @@ class Assets:
             ('stop', 'S', (220, 60, 60)),
             ('hold', 'H', (60, 120, 220)),
             ('attack_move', 'A', (220, 180, 50)),
+            ('patrol', 'P', (80, 200, 80)),
         ]:
             s = base()
             surf = self._font_med.render(text, True, col)
@@ -366,7 +434,10 @@ class Assets:
             self.ui_icons[f'cmd_{cmd_name}'] = s
 
     # ---------------------------------------------------------------- getters
-    def get_tile(self, tile_type):
+    def get_tile(self, tile_type, time=0.0):
+        if tile_type == TILE_WATER and self._water_frames:
+            idx = int(time * 2) % len(self._water_frames)
+            return self._water_frames[idx]
         return self.tiles.get(tile_type, self.tiles[TILE_GRASS])
 
     def get_unit(self, utype, team):
@@ -376,6 +447,19 @@ class Assets:
         if construction:
             return self.buildings.get(f'{btype}_construction')
         return self.buildings.get(f'{btype}_{team}')
+
+    def get_dead_unit(self, utype, team):
+        return self.units.get(f'{utype}_{team}_dead')
+
+    def get_rubble(self, btype):
+        return self.buildings.get(f'{btype}_rubble')
+
+    def get_damage_overlay(self, btype, hp_ratio):
+        if hp_ratio < 0.25:
+            return self.buildings.get(f'{btype}_fire')
+        elif hp_ratio < 0.5:
+            return self.buildings.get(f'{btype}_cracks')
+        return None
 
     def get_ghost(self, btype, valid):
         suffix = 'ok' if valid else 'bad'
