@@ -8,9 +8,12 @@ Lead your herd to victory — gather resources, build your base, train an army, 
 pip install pygame
 python main.py
 ```
+### Network
+
 Open up the following ports on your Windows firewall for multiplayer (it may ask when attempting a multiplayer game):
-UDP_PORT = 45678
-TCP_PORT = 45679
+- UDP_PORT = 45678
+- TCP_PORT = 45679
+
 ---
 
 ## Controls
