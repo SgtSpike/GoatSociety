@@ -218,11 +218,14 @@ class Game:
         """Place 4 neutral camps in mid-map areas with 2-3 wild goat defenders."""
         rng = random.Random(self.seed + 777)
         mw, mh = self._map_w, self._map_h
+        # Place camps in the middle band of the map, away from corner starts
+        cx_inner, cx_outer = mw * 3 // 8, mw * 5 // 8
+        cy_inner, cy_outer = mh * 3 // 8, mh * 5 // 8
         camp_positions = [
-            (mw // 4, mh // 4),
-            (mw * 3 // 4, mh // 4),
-            (mw // 4, mh * 3 // 4),
-            (mw * 3 // 4, mh * 3 // 4),
+            (cx_inner, cy_inner),
+            (cx_outer, cy_inner),
+            (cx_inner, cy_outer),
+            (cx_outer, cy_outer),
         ]
         for cx, cy in camp_positions:
             cx += rng.randint(-6, 6)

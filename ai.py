@@ -251,6 +251,11 @@ class AIController:
 
     # ---------------------------------------------------------------- attack
     def _maybe_attack(self, game, player):
+        # In KotH mode, use hill-focused strategy
+        if getattr(game, 'game_mode', 'standard') == 'king_of_hill':
+            self._maybe_attack_koth(game, player)
+            return
+
         interval = max(40.0, self.attack_interval - self.wave_num * 6) * self.attack_delay
         if self.attack_timer < interval:
             return
@@ -287,6 +292,70 @@ class AIController:
 
         for unit in fighters:
             unit.give_command(CmdData(Cmd.ATTACK, target=target_bld))
+
+    def _maybe_attack_koth(self, game, player):
+        """KotH AI: prioritise holding the hill; attack enemies on it."""
+        hill_wx = game._koth_cx * TILE_SIZE + TILE_SIZE // 2
+        hill_wy = game._koth_cy * TILE_SIZE + TILE_SIZE // 2
+        hill_r  = game._koth_radius * TILE_SIZE
+
+        fighters = [u for u in player.units
+                    if u.alive and u.utype in ('soldier', 'archer', 'knight')]
+
+        # Count our troops already on the hill
+        on_hill = [u for u in fighters
+                   if math.hypot(u.x - hill_wx, u.y - hill_wy) < hill_r]
+        idle    = [u for u in fighters if u.state == State.IDLE]
+
+        # Check if an enemy is contesting the hill
+        enemy_on_hill = []
+        for tid, p in game.players.items():
+            if tid == self.team or tid == NEUTRAL_TEAM:
+                continue
+            enemy_on_hill.extend(
+                u for u in p.units
+                if u.alive and u.utype != 'worker'
+                and math.hypot(u.x - hill_wx, u.y - hill_wy) < hill_r)
+
+        # Urgent: enemy holds the hill — send everyone available
+        if enemy_on_hill and idle:
+            target = min(enemy_on_hill,
+                         key=lambda u: math.hypot(u.x - hill_wx, u.y - hill_wy))
+            for u in idle:
+                u.give_command(CmdData(Cmd.ATTACK, target=target))
+            return
+
+        # If we have fewer than 3 troops on the hill, send idle fighters there
+        if len(on_hill) < 3 and idle:
+            for u in idle:
+                u.give_command(CmdData(Cmd.ATTACK_MOVE,
+                                       wx=hill_wx, wy=hill_wy))
+            return
+
+        # Otherwise, with the hill held, use excess idle fighters to harass
+        interval = max(40.0, self.attack_interval - self.wave_num * 6) * self.attack_delay
+        if self.attack_timer < interval:
+            return
+        self.attack_timer = 0.0
+        self.wave_num += 1
+
+        excess = [u for u in idle if u not in on_hill]
+        if len(excess) < 3:
+            return
+
+        # Attack-move toward enemy buildings
+        targets = []
+        for tid, p in game.players.items():
+            if tid == self.team or tid == NEUTRAL_TEAM:
+                continue
+            targets.extend(b for b in p.buildings if b.alive and b.is_constructed)
+        if not targets:
+            return
+        cx = sum(u.x for u in excess) / len(excess)
+        cy = sum(u.y for u in excess) / len(excess)
+        target_bld = min(targets, key=lambda b: math.hypot(b.x - cx, b.y - cy))
+        for u in excess:
+            u.give_command(CmdData(Cmd.ATTACK, target=target_bld))
 
     # ---------------------------------------------------------------- phase
     def _update_phase(self, player):
